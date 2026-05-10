@@ -1269,9 +1269,29 @@ def ask_more_text_for_mode(mode: str) -> str:
     return ask_more_text()
 
 
+def help_text(registered: bool = True, name: str | None = None) -> str:
+    greeting = f"Hoi {name}!" if registered and name else "Hoi! Ik ben je Griekse woordjesbot."
+    lines = [
+        greeting,
+        "",
+        "Zo werkt het:",
+        "/toets 10 - start een toetsronde van 10 woorden",
+        "/toets struikel - toets woorden die eerder fout gingen",
+        "/uitleg - oefen foute woorden met meerkeuze en uitleg",
+        "/hint - krijg hulp bij een open vraag",
+        "status - bekijk je weekscore en beloning",
+        "",
+    ]
+    if registered:
+        lines.append("Stuur bijvoorbeeld '/toets 10' om te beginnen.")
+    else:
+        lines.append("Hoe heet je? Stuur je naam, dan maak ik je profiel aan.")
+    return "\n".join(lines)
+
+
 def parse_toets_request(cleaned: str) -> dict[str, Any] | None:
     parts = cleaned.split()
-    if not parts or parts[0] not in {"toets", "quiz", "vraag", "start"}:
+    if not parts or parts[0] not in {"toets", "quiz", "vraag"}:
         return None
     source = "struikel" if any(part in {"struikel", "struikelwoorden", "fouten", "moeilijk"} for part in parts[1:]) else "normal"
     count = None
@@ -1324,12 +1344,17 @@ def miss_micro_text() -> str:
 def handle_answer(text: str, user: sqlite3.Row) -> str:
     cleaned = normalize(text)
     if not user["name"] or user["awaiting_name"]:
-        if cleaned in {"start", "quiz", "vraag", "toets", "uitleg", "ja"} or text.strip().startswith("/"):
-            return "Hoi! Hoe heet je?"
+        if cleaned in {"start", "help", "hulp"} or text.strip() in {"/start", "/help"}:
+            return help_text(registered=False)
+        if cleaned in {"quiz", "vraag", "toets", "uitleg", "ja"} or text.strip().startswith("/"):
+            return help_text(registered=False)
         user = set_user_name(user["id"], text)
-        return f"Leuk je te leren kennen, {user['name']}! Stuur '/toets' voor score of '/uitleg' om te oefenen."
+        return f"Leuk je te leren kennen, {user['name']}!\n\n{help_text(name=user['name'])}"
 
     prompt = active_prompt(user["id"])
+
+    if cleaned in {"start", "help", "hulp"} or text.strip() in {"/start", "/help"}:
+        return help_text(name=user["name"])
 
     toets_request = parse_toets_request(cleaned)
     if toets_request:

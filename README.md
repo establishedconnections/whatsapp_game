@@ -34,12 +34,21 @@ TELEGRAM_CHAT_ID=
 TELEGRAM_WEBHOOK_SECRET=kies-hier-een-lange-random-string
 ```
 
-Laat je zoon eerst `/start` sturen naar de bot. De backend kan dan zijn `chat_id` uit de events loggen; je kunt die invullen als `TELEGRAM_CHAT_ID` voor geplande vragen.
+Laat je zoon eerst `/start` sturen naar de bot. De bot toont dan een kort commando-overzicht en vraagt om zijn naam om een profiel aan te maken.
 
 Bij de eerste keer vraagt de bot:
 
 ```text
-Hoi! Hoe heet je?
+Hoi! Ik ben je Griekse woordjesbot.
+
+Zo werkt het:
+/toets 10 - start een toetsronde van 10 woorden
+/toets struikel - toets woorden die eerder fout gingen
+/uitleg - oefen foute woorden met meerkeuze en uitleg
+/hint - krijg hulp bij een open vraag
+status - bekijk je weekscore en beloning
+
+Hoe heet je? Stuur je naam, dan maak ik je profiel aan.
 ```
 
 Daarna worden score, open quizvragen en herhalingsschema per gebruiker apart bijgehouden.
