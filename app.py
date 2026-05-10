@@ -425,6 +425,7 @@ def init_db() -> None:
                 external_id TEXT NOT NULL,
                 name TEXT,
                 awaiting_name INTEGER NOT NULL DEFAULT 1,
+                last_mode TEXT NOT NULL DEFAULT 'toets',
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 UNIQUE(platform, external_id)
@@ -460,6 +461,7 @@ def init_db() -> None:
                 correct INTEGER,
                 hint_used INTEGER NOT NULL DEFAULT 0,
                 score REAL,
+                mode TEXT NOT NULL DEFAULT 'toets',
                 FOREIGN KEY(word_id) REFERENCES words(id)
             )
             """
@@ -491,6 +493,11 @@ def init_db() -> None:
             con.execute("ALTER TABLE prompts ADD COLUMN hint_used INTEGER NOT NULL DEFAULT 0")
         if "score" not in prompt_columns:
             con.execute("ALTER TABLE prompts ADD COLUMN score REAL")
+        if "mode" not in prompt_columns:
+            con.execute("ALTER TABLE prompts ADD COLUMN mode TEXT NOT NULL DEFAULT 'toets'")
+        user_columns = {row[1] for row in con.execute("PRAGMA table_info(users)")}
+        if "last_mode" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN last_mode TEXT NOT NULL DEFAULT 'toets'")
         word_columns = {row[1] for row in con.execute("PRAGMA table_info(words)")}
         if "hint_text" not in word_columns:
             con.execute("ALTER TABLE words ADD COLUMN hint_text TEXT")
@@ -560,6 +567,11 @@ def set_user_name(user_id: int, name: str) -> sqlite3.Row:
         return con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
+def set_user_mode(user_id: int, mode: str) -> None:
+    with db() as con:
+        con.execute("UPDATE users SET last_mode = ?, last_seen_at = ? WHERE id = ?", (mode, dt(now()), user_id))
+
+
 def choose_word(user_id: int) -> sqlite3.Row:
     with db() as con:
         initialize_user_words(con, user_id)
@@ -593,6 +605,50 @@ def choose_word(user_id: int) -> sqlite3.Row:
     return random.choice(weighted)
 
 
+def choose_review_word(user_id: int) -> sqlite3.Row:
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT words.*, user_words.box, user_words.correct_count,
+                   user_words.wrong_count, user_words.due_at, user_words.last_seen_at
+            FROM prompts
+            JOIN words ON words.id = prompts.word_id
+            JOIN user_words ON user_words.word_id = prompts.word_id
+                AND user_words.user_id = prompts.user_id
+            WHERE prompts.user_id = ?
+              AND prompts.mode = 'toets'
+              AND prompts.answered_at IS NOT NULL
+              AND prompts.correct = 0
+            GROUP BY words.id
+            ORDER BY MAX(prompts.answered_at) DESC
+            LIMIT 12
+            """,
+            (user_id,),
+        ).fetchall()
+    if rows:
+        weighted: list[sqlite3.Row] = []
+        for index, row in enumerate(rows):
+            weighted.extend([row] * max(1, 12 - index))
+        return random.choice(weighted)
+    return choose_word(user_id)
+
+
+def review_word_count(user_id: int) -> int:
+    with db() as con:
+        row = con.execute(
+            """
+            SELECT COUNT(DISTINCT word_id) AS count
+            FROM prompts
+            WHERE user_id = ?
+              AND mode = 'toets'
+              AND answered_at IS NOT NULL
+              AND correct = 0
+            """,
+            (user_id,),
+        ).fetchone()
+    return int(row["count"] or 0)
+
+
 def active_prompt(user_id: int) -> sqlite3.Row | None:
     with db() as con:
         return con.execute(
@@ -609,14 +665,14 @@ def active_prompt(user_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
-def create_prompt(user_id: int, word_id: int) -> sqlite3.Row:
+def create_prompt(user_id: int, word_id: int, mode: str = "toets") -> sqlite3.Row:
     timeout = int(ENV.get("ANSWER_TIMEOUT_MINUTES", "5"))
     sent = now()
     expires = sent + timedelta(minutes=timeout)
     with db() as con:
         cur = con.execute(
-            "INSERT INTO prompts(user_id, word_id, sent_at, expires_at) VALUES (?, ?, ?, ?)",
-            (user_id, word_id, dt(sent), dt(expires)),
+            "INSERT INTO prompts(user_id, word_id, sent_at, expires_at, mode) VALUES (?, ?, ?, ?, ?)",
+            (user_id, word_id, dt(sent), dt(expires), mode),
         )
         prompt_id = cur.lastrowid
         return con.execute(
@@ -633,7 +689,9 @@ def create_prompt(user_id: int, word_id: int) -> sqlite3.Row:
 
 def quiz_text(prompt: sqlite3.Row) -> str:
     mins = ENV.get("ANSWER_TIMEOUT_MINUTES", "5")
-    return f"Grieks quizwoord: {prompt['greek']}\nWat is de Nederlandse vertaling? Je hebt {mins} minuten."
+    if row_value(prompt, "mode", "toets") == "uitleg":
+        return f"Uitlegwoord: {prompt['greek']}\nProbeer de Nederlandse vertaling. Dit telt niet mee voor je score."
+    return f"Toetswoord: {prompt['greek']}\nWat is de Nederlandse vertaling? Je hebt {mins} minuten."
 
 
 def hint_score() -> float:
@@ -686,6 +744,18 @@ def update_word_after_answer(prompt: sqlite3.Row, answer: str, correct: bool) ->
         )
 
 
+def record_unscored_answer(prompt: sqlite3.Row, answer: str, correct: bool) -> None:
+    with db() as con:
+        con.execute(
+            """
+            UPDATE prompts
+            SET answered_at = ?, answer = ?, correct = ?, score = NULL
+            WHERE id = ?
+            """,
+            (dt(now()), answer, 1 if correct else 0, prompt["id"]),
+        )
+
+
 def mark_expired(user_id: int | None = None) -> int:
     expired: list[sqlite3.Row]
     with db() as con:
@@ -706,6 +776,12 @@ def mark_expired(user_id: int | None = None) -> int:
             params,
         ).fetchall()
         for prompt in expired:
+            if row_value(prompt, "mode", "toets") != "toets":
+                con.execute(
+                    "UPDATE prompts SET answered_at = ?, answer = ?, correct = 0, score = NULL WHERE id = ?",
+                    (dt(now()), "[geen antwoord binnen 5 minuten]", prompt["id"]),
+                )
+                continue
             new_box = max(0, int(prompt["box"]) - 1)
             con.execute(
                 "UPDATE prompts SET answered_at = ?, answer = ?, correct = 0, score = 0 WHERE id = ?",
@@ -844,21 +920,26 @@ def telegram_send(body: str, to: str | None = None) -> dict[str, Any]:
     return response
 
 
-def send_quiz_now(user_id: int, to: str | None = None) -> sqlite3.Row:
+def send_quiz_now(user_id: int, to: str | None = None, mode: str = "toets") -> sqlite3.Row:
     current = active_prompt(user_id)
     if current and parse_dt(current["expires_at"]) and parse_dt(current["expires_at"]) > now():
         return current
-    word = choose_word(user_id)
-    prompt = create_prompt(user_id, word["id"])
+    word = choose_review_word(user_id) if mode == "uitleg" else choose_word(user_id)
+    prompt = create_prompt(user_id, word["id"], mode)
     send_message(quiz_text(prompt), template_word=prompt["greek"], to=to)
-    log_event("prompt_sent", {"prompt_id": prompt["id"], "user_id": user_id, "word_id": prompt["word_id"], "greek": prompt["greek"]})
+    set_user_mode(user_id, mode)
+    log_event("prompt_sent", {"prompt_id": prompt["id"], "user_id": user_id, "word_id": prompt["word_id"], "greek": prompt["greek"], "mode": mode})
     return prompt
 
 
-def new_quiz_text(user_id: int) -> str:
-    word = choose_word(user_id)
-    prompt = create_prompt(user_id, word["id"])
-    log_event("prompt_created", {"prompt_id": prompt["id"], "user_id": user_id, "word_id": prompt["word_id"], "greek": prompt["greek"]})
+def new_quiz_text(user_id: int, mode: str = "toets") -> str:
+    review_count = review_word_count(user_id) if mode == "uitleg" else 0
+    word = choose_review_word(user_id) if mode == "uitleg" else choose_word(user_id)
+    prompt = create_prompt(user_id, word["id"], mode)
+    set_user_mode(user_id, mode)
+    log_event("prompt_created", {"prompt_id": prompt["id"], "user_id": user_id, "word_id": prompt["word_id"], "greek": prompt["greek"], "mode": mode})
+    if mode == "uitleg" and review_count == 0:
+        return "Je hebt nog geen foute toetswoorden om uit te leggen. We oefenen daarom een gewoon woord, zonder score.\n" + quiz_text(prompt)
     return quiz_text(prompt)
 
 
@@ -968,6 +1049,7 @@ def weekly_progress(user_id: int) -> dict[str, Any]:
             WHERE answered_at IS NOT NULL
               AND correct IS NOT NULL
               AND user_id = ?
+              AND mode = 'toets'
               AND answered_at >= ?
             """,
             (user_id, dt(start)),
@@ -1023,6 +1105,12 @@ def ask_more_text() -> str:
     return "Wil je er nog een? Antwoord met ja of nee."
 
 
+def ask_more_text_for_mode(mode: str) -> str:
+    if mode == "uitleg":
+        return "Wil je nog een uitlegwoord? Antwoord met ja of nee."
+    return ask_more_text()
+
+
 def configured_lines(key: str, fallback: list[str]) -> list[str]:
     raw = ENV.get(key, "")
     if not raw.strip():
@@ -1063,32 +1151,50 @@ def miss_micro_text() -> str:
 def handle_answer(text: str, user: sqlite3.Row) -> str:
     cleaned = normalize(text)
     if not user["name"] or user["awaiting_name"]:
-        if cleaned in {"start", "quiz", "vraag", "ja"} or text.strip().startswith("/"):
+        if cleaned in {"start", "quiz", "vraag", "toets", "uitleg", "ja"} or text.strip().startswith("/"):
             return "Hoi! Hoe heet je?"
         user = set_user_name(user["id"], text)
-        return f"Leuk je te leren kennen, {user['name']}! Stuur 'quiz' voor je eerste Griekse woord."
+        return f"Leuk je te leren kennen, {user['name']}! Stuur '/toets' voor score of '/uitleg' om te oefenen."
 
     prompt = active_prompt(user["id"])
 
-    if cleaned in {"start", "quiz", "vraag"}:
-        if prompt and parse_dt(prompt["expires_at"]) and parse_dt(prompt["expires_at"]) > now():
+    if cleaned in {"start", "quiz", "vraag", "toets"}:
+        if (
+            prompt
+            and row_value(prompt, "mode", "toets") == "toets"
+            and parse_dt(prompt["expires_at"])
+            and parse_dt(prompt["expires_at"]) > now()
+        ):
             return quiz_text(prompt)
         if prompt:
             mark_expired(user["id"])
-        return new_quiz_text(user["id"])
+        return new_quiz_text(user["id"], "toets")
+
+    if cleaned in {"uitleg", "oefen", "oefenen"}:
+        if (
+            prompt
+            and row_value(prompt, "mode", "toets") == "uitleg"
+            and parse_dt(prompt["expires_at"])
+            and parse_dt(prompt["expires_at"]) > now()
+        ):
+            return quiz_text(prompt)
+        if prompt:
+            mark_expired(user["id"])
+        return new_quiz_text(user["id"], "uitleg")
 
     if not prompt:
         if is_yes(text):
-            return new_quiz_text(user["id"])
+            mode = row_value(user, "last_mode", "toets") or "toets"
+            return new_quiz_text(user["id"], mode)
         if is_no(text):
-            return "Prima, later weer verder. Stuur 'ja' of 'quiz' als je nog een woord wilt."
+            return "Prima, later weer verder. Stuur '/toets' voor score of '/uitleg' om te oefenen."
         if cleaned in {"status", "score", "beloning"}:
             return weekly_progress_text(user["id"])
         if cleaned in {"naam", "name"}:
             with db() as con:
                 con.execute("UPDATE users SET awaiting_name = 1 WHERE id = ?", (user["id"],))
             return "Hoe heet je?"
-        return "Er staat nu geen quizvraag open. Stuur 'ja' of 'quiz' voor een nieuwe vraag, of 'status' voor je weekscore."
+        return "Er staat nu geen quizvraag open. Stuur '/toets' voor score, '/uitleg' om te oefenen, of 'status' voor je weekscore."
 
     if is_yes(text):
         return quiz_text(prompt)
@@ -1104,7 +1210,9 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
 
     if parse_dt(prompt["expires_at"]) and parse_dt(prompt["expires_at"]) < now():
         mark_expired(user["id"])
-        return f"Net te laat. Het antwoord was: {prompt['meaning']}.\n{weekly_progress_text(user['id'])}\n{ask_more_text()}"
+        mode = row_value(prompt, "mode", "toets")
+        progress = "" if mode == "uitleg" else f"\n{weekly_progress_text(user['id'])}"
+        return f"Net te laat. Het antwoord was: {prompt['meaning']}.{progress}\n{ask_more_text_for_mode(mode)}"
 
     with db() as con:
         prompt = con.execute(
@@ -1128,16 +1236,26 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
             and float(ai_result.get("confidence", 0)) >= ai_min_confidence()
         ):
             correct = True
+    mode = row_value(prompt, "mode", "toets")
+    set_user_mode(user["id"], mode)
+    if mode == "uitleg":
+        record_unscored_answer(prompt, text, correct)
+        ai_note = ""
+        if ai_result and ai_result.get("reason_dutch"):
+            ai_note = f"\nIk snap je gedachte: {ai_result['reason_dutch']}"
+        verdict = "Mooi, dat klopt." if correct else f"Nog niet helemaal. {miss_micro_text()}"
+        return f"{verdict}{ai_note}\nDit telt niet mee voor je score.\n{prompt['greek']} = {prompt['meaning']}.\n{explanation(prompt)}\n{ai_hint(prompt)}\n{ask_more_text_for_mode(mode)}"
+
     update_word_after_answer(prompt, text, correct)
     if correct:
         ai_note = ""
         if ai_result and ai_result.get("reason_dutch"):
             ai_note = f"\nIk telde dit goed: {ai_result['reason_dutch']}"
-        return f"Goed, {user['name']}! ✅\n{prompt['greek']} = {prompt['meaning']}{ai_note}\n{success_micro_reward()}\n{weekly_progress_text(user['id'])}\n{ask_more_text()}"
+        return f"Goed, {user['name']}! ✅\n{prompt['greek']} = {prompt['meaning']}{ai_note}\n{success_micro_reward()}\n{weekly_progress_text(user['id'])}\n{ask_more_text_for_mode(mode)}"
     feedback = ""
     if ai_result and ai_result.get("safe_feedback_dutch"):
         feedback = f"\n{ai_result['safe_feedback_dutch']}"
-    return f"Bijna, maar niet goed. {miss_micro_text()}{feedback}\nHet juiste antwoord is: {prompt['meaning']}.\n{explanation(prompt)}\n{weekly_progress_text(user['id'])}\n{ask_more_text()}"
+    return f"Bijna, maar niet goed. {miss_micro_text()}{feedback}\nHet juiste antwoord is: {prompt['meaning']}.\n{explanation(prompt)}\n{weekly_progress_text(user['id'])}\n{ask_more_text_for_mode(mode)}"
 
 
 def stats() -> dict[str, Any]:
@@ -1176,7 +1294,7 @@ def stats() -> dict[str, Any]:
         ).fetchall()
         users = con.execute(
             """
-            SELECT id, platform, external_id, name, awaiting_name, created_at, last_seen_at
+            SELECT id, platform, external_id, name, awaiting_name, last_mode, created_at, last_seen_at
             FROM users
             ORDER BY last_seen_at DESC
             """

@@ -203,13 +203,18 @@ Na elk beantwoord woord krijgt de leerling feedback plus:
 Wil je er nog een? Antwoord met ja of nee.
 ```
 
-Als hij `ja`, `quiz`, `meer`, `volgende` of `nog een` stuurt, krijgt hij meteen een nieuw woord.
+Er zijn twee modi:
+
+- `/toets`: echte toetsmodus. Antwoorden tellen mee voor score, beloningen en herhalingsschema.
+- `/uitleg`: oefenmodus op recente fouten uit de toets. Antwoorden tellen niet mee; de bot legt het woord extra uit met hint en vormen.
+
+`quiz` blijft als oude alias voor `/toets` werken. Als hij `ja`, `meer`, `volgende` of `nog een` stuurt, krijgt hij meteen een nieuw woord in dezelfde modus als net gebruikt.
 
 Als hij `nee`, `stop`, `klaar` of `later` stuurt, stopt de speelsessie rustig.
 
 Met `status`, `score` of `beloning` krijgt hij de weekscore te zien.
 
-Met `/hint`, `hint`, `tip` of `hulp` krijgt hij een hulpje richting het antwoord, zonder dat het antwoord letterlijk verklapt wordt. Een goed antwoord na een hint telt standaard voor een half punt in de weekscore:
+Met `/hint`, `hint`, `tip` of `hulp` krijgt hij een hulpje richting het antwoord, zonder dat het antwoord letterlijk verklapt wordt. In `/toets` telt een goed antwoord na een hint standaard voor een half punt in de weekscore:
 
 ```env
 HINT_SCORE=0.5
