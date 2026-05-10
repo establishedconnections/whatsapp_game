@@ -13,6 +13,7 @@ Een kleine Telegram/WhatsApp-quizbackend voor de Griekse werkwoordenlijst t/m le
 - Weekscore met beloningen, bijvoorbeeld ijsje / bios-bezoek / t-shirt.
 - Kleine uitleg na een fout antwoord.
 - Grappige micro-beloningstekst na een goed antwoord.
+- Meerdere gebruikers met eigen naam, eigen score en eigen herhalingsschema.
 
 ## Aanbevolen: Telegram
 
@@ -34,6 +35,14 @@ TELEGRAM_WEBHOOK_SECRET=kies-hier-een-lange-random-string
 ```
 
 Laat je zoon eerst `/start` sturen naar de bot. De backend kan dan zijn `chat_id` uit de events loggen; je kunt die invullen als `TELEGRAM_CHAT_ID` voor geplande vragen.
+
+Bij de eerste keer vraagt de bot:
+
+```text
+Hoi! Hoe heet je?
+```
+
+Daarna worden score, open quizvragen en herhalingsschema per gebruiker apart bijgehouden.
 
 Telegram webhook URL:
 

@@ -231,8 +231,39 @@ def init_db() -> None:
         )
         con.execute(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                platform TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                name TEXT,
+                awaiting_name INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                UNIQUE(platform, external_id)
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_words (
+                user_id INTEGER NOT NULL,
+                word_id INTEGER NOT NULL,
+                box INTEGER NOT NULL DEFAULT 0,
+                correct_count INTEGER NOT NULL DEFAULT 0,
+                wrong_count INTEGER NOT NULL DEFAULT 0,
+                due_at TEXT NOT NULL,
+                last_seen_at TEXT,
+                PRIMARY KEY(user_id, word_id),
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                FOREIGN KEY(word_id) REFERENCES words(id)
+            )
+            """
+        )
+        con.execute(
+            """
             CREATE TABLE IF NOT EXISTS prompts (
                 id INTEGER PRIMARY KEY,
+                user_id INTEGER,
                 word_id INTEGER NOT NULL,
                 sent_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
@@ -263,6 +294,9 @@ def init_db() -> None:
                 """,
                 (greek, imperfectum, aoristus, meaning, due),
             )
+        columns = {row[1] for row in con.execute("PRAGMA table_info(prompts)")}
+        if "user_id" not in columns:
+            con.execute("ALTER TABLE prompts ADD COLUMN user_id INTEGER")
 
 
 def db() -> sqlite3.Connection:
@@ -279,13 +313,78 @@ def log_event(kind: str, payload: dict[str, Any]) -> None:
         )
 
 
-def choose_word() -> sqlite3.Row:
+def get_or_create_user(platform: str, external_id: str) -> sqlite3.Row:
+    seen = dt(now())
     with db() as con:
+        row = con.execute(
+            "SELECT * FROM users WHERE platform = ? AND external_id = ?",
+            (platform, external_id),
+        ).fetchone()
+        if row:
+            con.execute("UPDATE users SET last_seen_at = ? WHERE id = ?", (seen, row["id"]))
+            return con.execute("SELECT * FROM users WHERE id = ?", (row["id"],)).fetchone()
+        cur = con.execute(
+            """
+            INSERT INTO users(platform, external_id, created_at, last_seen_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (platform, external_id, seen, seen),
+        )
+        user_id = cur.lastrowid
+        initialize_user_words(con, user_id)
+        return con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def initialize_user_words(con: sqlite3.Connection, user_id: int) -> None:
+    due = dt(now())
+    con.execute(
+        """
+        INSERT OR IGNORE INTO user_words(user_id, word_id, due_at)
+        SELECT ?, id, ? FROM words
+        """,
+        (user_id, due),
+    )
+
+
+def set_user_name(user_id: int, name: str) -> sqlite3.Row:
+    clean = name.strip()
+    clean = re.sub(r"\s+", " ", clean)
+    clean = clean[:40] or "leerling"
+    with db() as con:
+        con.execute(
+            "UPDATE users SET name = ?, awaiting_name = 0, last_seen_at = ? WHERE id = ?",
+            (clean, dt(now()), user_id),
+        )
+        initialize_user_words(con, user_id)
+        return con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def choose_word(user_id: int) -> sqlite3.Row:
+    with db() as con:
+        initialize_user_words(con, user_id)
         due_rows = con.execute(
-            "SELECT * FROM words WHERE due_at <= ? ORDER BY due_at ASC",
-            (dt(now()),),
+            """
+            SELECT words.*, user_words.box, user_words.correct_count,
+                   user_words.wrong_count, user_words.due_at, user_words.last_seen_at
+            FROM user_words
+            JOIN words ON words.id = user_words.word_id
+            WHERE user_words.user_id = ? AND user_words.due_at <= ?
+            ORDER BY user_words.due_at ASC
+            """,
+            (user_id, dt(now())),
         ).fetchall()
-        rows = due_rows or con.execute("SELECT * FROM words ORDER BY due_at ASC LIMIT 10").fetchall()
+        rows = due_rows or con.execute(
+            """
+            SELECT words.*, user_words.box, user_words.correct_count,
+                   user_words.wrong_count, user_words.due_at, user_words.last_seen_at
+            FROM user_words
+            JOIN words ON words.id = user_words.word_id
+            WHERE user_words.user_id = ?
+            ORDER BY user_words.due_at ASC
+            LIMIT 10
+            """,
+            (user_id,),
+        ).fetchall()
     weighted: list[sqlite3.Row] = []
     for row in rows:
         weight = max(1, 6 - row["box"]) + row["wrong_count"] * 2
@@ -293,28 +392,29 @@ def choose_word() -> sqlite3.Row:
     return random.choice(weighted)
 
 
-def active_prompt() -> sqlite3.Row | None:
+def active_prompt(user_id: int) -> sqlite3.Row | None:
     with db() as con:
         return con.execute(
             """
             SELECT prompts.*, words.greek, words.meaning, words.imperfectum, words.aoristus
             FROM prompts
             JOIN words ON words.id = prompts.word_id
-            WHERE answered_at IS NULL
+            WHERE prompts.user_id = ? AND answered_at IS NULL
             ORDER BY sent_at DESC
             LIMIT 1
-            """
+            """,
+            (user_id,),
         ).fetchone()
 
 
-def create_prompt(word_id: int) -> sqlite3.Row:
+def create_prompt(user_id: int, word_id: int) -> sqlite3.Row:
     timeout = int(ENV.get("ANSWER_TIMEOUT_MINUTES", "5"))
     sent = now()
     expires = sent + timedelta(minutes=timeout)
     with db() as con:
         cur = con.execute(
-            "INSERT INTO prompts(word_id, sent_at, expires_at) VALUES (?, ?, ?)",
-            (word_id, dt(sent), dt(expires)),
+            "INSERT INTO prompts(user_id, word_id, sent_at, expires_at) VALUES (?, ?, ?, ?)",
+            (user_id, word_id, dt(sent), dt(expires)),
         )
         prompt_id = cur.lastrowid
         return con.execute(
@@ -356,29 +456,36 @@ def update_word_after_answer(prompt: sqlite3.Row, answer: str, correct: bool) ->
         )
         con.execute(
             """
-            UPDATE words
+            UPDATE user_words
             SET box = ?,
                 correct_count = correct_count + ?,
                 wrong_count = wrong_count + ?,
                 due_at = ?,
                 last_seen_at = ?
-            WHERE id = ?
+            WHERE user_id = ? AND word_id = ?
             """,
-            (new_box, 1 if correct else 0, 0 if correct else 1, dt(due_at), dt(now()), prompt["word_id"]),
+            (new_box, 1 if correct else 0, 0 if correct else 1, dt(due_at), dt(now()), prompt["user_id"], prompt["word_id"]),
         )
 
 
-def mark_expired() -> int:
+def mark_expired(user_id: int | None = None) -> int:
     expired: list[sqlite3.Row]
     with db() as con:
+        params: list[Any] = [dt(now())]
+        user_filter = ""
+        if user_id is not None:
+            user_filter = "AND prompts.user_id = ?"
+            params.append(user_id)
         expired = con.execute(
-            """
-            SELECT prompts.*, words.box
+            f"""
+            SELECT prompts.*, user_words.box
             FROM prompts
-            JOIN words ON words.id = prompts.word_id
+            JOIN user_words ON user_words.word_id = prompts.word_id
+                AND user_words.user_id = prompts.user_id
             WHERE answered_at IS NULL AND expires_at < ?
+            {user_filter}
             """,
-            (dt(now()),),
+            params,
         ).fetchall()
         for prompt in expired:
             new_box = max(0, int(prompt["box"]) - 1)
@@ -388,11 +495,11 @@ def mark_expired() -> int:
             )
             con.execute(
                 """
-                UPDATE words
+                UPDATE user_words
                 SET box = ?, wrong_count = wrong_count + 1, due_at = ?, last_seen_at = ?
-                WHERE id = ?
+                WHERE user_id = ? AND word_id = ?
                 """,
-                (new_box, dt(now() + timedelta(minutes=10)), dt(now()), prompt["word_id"]),
+                (new_box, dt(now() + timedelta(minutes=10)), dt(now()), prompt["user_id"], prompt["word_id"]),
             )
     return len(expired)
 
@@ -519,21 +626,21 @@ def telegram_send(body: str, to: str | None = None) -> dict[str, Any]:
     return response
 
 
-def send_quiz_now() -> sqlite3.Row:
-    current = active_prompt()
+def send_quiz_now(user_id: int, to: str | None = None) -> sqlite3.Row:
+    current = active_prompt(user_id)
     if current and parse_dt(current["expires_at"]) and parse_dt(current["expires_at"]) > now():
         return current
-    word = choose_word()
-    prompt = create_prompt(word["id"])
-    send_message(quiz_text(prompt), template_word=prompt["greek"])
-    log_event("prompt_sent", {"prompt_id": prompt["id"], "word_id": prompt["word_id"], "greek": prompt["greek"]})
+    word = choose_word(user_id)
+    prompt = create_prompt(user_id, word["id"])
+    send_message(quiz_text(prompt), template_word=prompt["greek"], to=to)
+    log_event("prompt_sent", {"prompt_id": prompt["id"], "user_id": user_id, "word_id": prompt["word_id"], "greek": prompt["greek"]})
     return prompt
 
 
-def new_quiz_text() -> str:
-    word = choose_word()
-    prompt = create_prompt(word["id"])
-    log_event("prompt_created", {"prompt_id": prompt["id"], "word_id": prompt["word_id"], "greek": prompt["greek"]})
+def new_quiz_text(user_id: int) -> str:
+    word = choose_word(user_id)
+    prompt = create_prompt(user_id, word["id"])
+    log_event("prompt_created", {"prompt_id": prompt["id"], "user_id": user_id, "word_id": prompt["word_id"], "greek": prompt["greek"]})
     return quiz_text(prompt)
 
 
@@ -589,6 +696,24 @@ def extract_telegram_message(payload: dict[str, Any]) -> dict[str, str] | None:
     }
 
 
+def configured_user() -> sqlite3.Row | None:
+    provider = bot_provider()
+    external_id = ""
+    if provider == "telegram":
+        external_id = ENV.get("TELEGRAM_CHAT_ID", "")
+    elif provider == "meta":
+        external_id = ENV.get("STUDENT_TO", "").replace("whatsapp:", "")
+        external_id = re.sub(r"[^\d+]", "", external_id)
+    else:
+        external_id = ENV.get("STUDENT_TO", "")
+    if not external_id:
+        return None
+    user = get_or_create_user(provider, external_id)
+    if not user["name"]:
+        user = set_user_name(user["id"], ENV.get("DEFAULT_STUDENT_NAME", "leerling"))
+    return user
+
+
 def is_yes(text: str) -> bool:
     return normalize(text) in {"ja", "j", "yes", "y", "nog een", "meer", "volgende", "door", "quiz", "start"}
 
@@ -611,7 +736,7 @@ def reward_tiers() -> list[tuple[int, str]]:
     ]
 
 
-def weekly_progress() -> dict[str, Any]:
+def weekly_progress(user_id: int) -> dict[str, Any]:
     start = week_start()
     with db() as con:
         row = con.execute(
@@ -622,9 +747,10 @@ def weekly_progress() -> dict[str, Any]:
             FROM prompts
             WHERE answered_at IS NOT NULL
               AND correct IS NOT NULL
+              AND user_id = ?
               AND answered_at >= ?
             """,
-            (dt(start),),
+            (user_id, dt(start)),
         ).fetchone()
     answered = int(row["answered"] or 0)
     correct = int(row["correct"] or 0)
@@ -651,8 +777,8 @@ def weekly_progress() -> dict[str, Any]:
     }
 
 
-def weekly_progress_text() -> str:
-    progress = weekly_progress()
+def weekly_progress_text(user_id: int) -> str:
+    progress = weekly_progress(user_id)
     base = f"Weekscore: {progress['correct']}/{progress['answered']} goed ({progress['percent']}%)."
     if progress["answered"] < progress["minimum"]:
         left = progress["minimum"] - progress["answered"]
@@ -707,24 +833,34 @@ def miss_micro_text() -> str:
     return random.choice(lines)
 
 
-def handle_answer(text: str) -> str:
+def handle_answer(text: str, user: sqlite3.Row) -> str:
     cleaned = normalize(text)
-    prompt = active_prompt()
+    if not user["name"] or user["awaiting_name"]:
+        if cleaned in {"start", "quiz", "vraag", "ja"} or text.strip().startswith("/"):
+            return "Hoi! Hoe heet je?"
+        user = set_user_name(user["id"], text)
+        return f"Leuk je te leren kennen, {user['name']}! Stuur 'quiz' voor je eerste Griekse woord."
+
+    prompt = active_prompt(user["id"])
 
     if cleaned in {"start", "quiz", "vraag"}:
         if prompt and parse_dt(prompt["expires_at"]) and parse_dt(prompt["expires_at"]) > now():
             return quiz_text(prompt)
         if prompt:
-            mark_expired()
-        return new_quiz_text()
+            mark_expired(user["id"])
+        return new_quiz_text(user["id"])
 
     if not prompt:
         if is_yes(text):
-            return new_quiz_text()
+            return new_quiz_text(user["id"])
         if is_no(text):
             return "Prima, later weer verder. Stuur 'ja' of 'quiz' als je nog een woord wilt."
         if cleaned in {"status", "score", "beloning"}:
-            return weekly_progress_text()
+            return weekly_progress_text(user["id"])
+        if cleaned in {"naam", "name"}:
+            with db() as con:
+                con.execute("UPDATE users SET awaiting_name = 1 WHERE id = ?", (user["id"],))
+            return "Hoe heet je?"
         return "Er staat nu geen quizvraag open. Stuur 'ja' of 'quiz' voor een nieuwe vraag, of 'status' voor je weekscore."
 
     if is_yes(text):
@@ -732,18 +868,20 @@ def handle_answer(text: str) -> str:
     if is_no(text):
         return "Prima, later weer verder. Je huidige quizvraag blijft nog even open; stuur de vertaling of later 'quiz' voor een nieuwe vraag."
     if cleaned in {"status", "score", "beloning"}:
-        return weekly_progress_text()
+        return weekly_progress_text(user["id"])
 
     if parse_dt(prompt["expires_at"]) and parse_dt(prompt["expires_at"]) < now():
-        mark_expired()
-        return f"Net te laat. Het antwoord was: {prompt['meaning']}.\n{weekly_progress_text()}\n{ask_more_text()}"
+        mark_expired(user["id"])
+        return f"Net te laat. Het antwoord was: {prompt['meaning']}.\n{weekly_progress_text(user['id'])}\n{ask_more_text()}"
 
     with db() as con:
         prompt = con.execute(
             """
-            SELECT prompts.*, words.*, prompts.id AS id
+            SELECT prompts.*, words.*, user_words.box, prompts.id AS id
             FROM prompts
             JOIN words ON words.id = prompts.word_id
+            JOIN user_words ON user_words.word_id = prompts.word_id
+                AND user_words.user_id = prompts.user_id
             WHERE prompts.id = ?
             """,
             (prompt["id"],),
@@ -751,8 +889,8 @@ def handle_answer(text: str) -> str:
     correct = is_correct(text, prompt["meaning"])
     update_word_after_answer(prompt, text, correct)
     if correct:
-        return f"Goed! ✅\n{prompt['greek']} = {prompt['meaning']}\n{success_micro_reward()}\n{weekly_progress_text()}\n{ask_more_text()}"
-    return f"Bijna, maar niet goed. {miss_micro_text()}\nHet juiste antwoord is: {prompt['meaning']}.\n{explanation(prompt)}\n{weekly_progress_text()}\n{ask_more_text()}"
+        return f"Goed, {user['name']}! ✅\n{prompt['greek']} = {prompt['meaning']}\n{success_micro_reward()}\n{weekly_progress_text(user['id'])}\n{ask_more_text()}"
+    return f"Bijna, maar niet goed. {miss_micro_text()}\nHet juiste antwoord is: {prompt['meaning']}.\n{explanation(prompt)}\n{weekly_progress_text(user['id'])}\n{ask_more_text()}"
 
 
 def stats() -> dict[str, Any]:
@@ -760,28 +898,40 @@ def stats() -> dict[str, Any]:
         totals = con.execute(
             """
             SELECT
-              COUNT(*) AS words,
+              COUNT(*) AS user_words,
               SUM(correct_count) AS correct,
               SUM(wrong_count) AS wrong,
               AVG(box) AS avg_box
-            FROM words
+            FROM user_words
             """
         ).fetchone()
         hardest = con.execute(
             """
-            SELECT greek, meaning, correct_count, wrong_count, box, due_at
-            FROM words
+            SELECT users.name, users.platform, words.greek, words.meaning,
+                   user_words.correct_count, user_words.wrong_count,
+                   user_words.box, user_words.due_at
+            FROM user_words
+            JOIN users ON users.id = user_words.user_id
+            JOIN words ON words.id = user_words.word_id
             ORDER BY wrong_count DESC, box ASC, due_at ASC
             LIMIT 10
             """
         ).fetchall()
+        users = con.execute(
+            """
+            SELECT id, platform, external_id, name, awaiting_name, created_at, last_seen_at
+            FROM users
+            ORDER BY last_seen_at DESC
+            """
+        ).fetchall()
     return {
-        "words": totals["words"],
+        "words": len(ROWS),
+        "user_words": totals["user_words"] or 0,
         "correct": totals["correct"] or 0,
         "wrong": totals["wrong"] or 0,
         "avg_box": round(float(totals["avg_box"] or 0), 2),
-        "weekly": weekly_progress(),
         "schedule": schedule_status(),
+        "users": [dict(row) for row in users],
         "settings": {
             "days": ENV.get("QUIZ_DAYS", "mon,tue,wed,thu,fri,sat,sun"),
             "window": f"{ENV.get('QUIZ_WINDOW_START', '07:30')}-{ENV.get('QUIZ_WINDOW_END', '20:30')}",
@@ -828,15 +978,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/admin/send-now":
-            prompt = send_quiz_now()
+            user = configured_user()
+            if not user:
+                self.send(400, json.dumps({"error": "No configured user/chat id"}).encode())
+                return
+            prompt = send_quiz_now(user["id"], to=user["external_id"])
             self.send(200, json.dumps({"sent": True, "prompt": dict(prompt)}, ensure_ascii=False).encode())
             return
         if parsed.path == "/twilio/inbound":
             data = parse_qs(self.read_body().decode("utf-8"))
             text = data.get("Body", [""])[0]
             from_ = data.get("From", [""])[0]
+            user = get_or_create_user("twilio", from_)
             log_event("inbound", {"from": from_, "body": text})
-            reply = handle_answer(text)
+            reply = handle_answer(text, user)
             self.send(200, twiml(reply), "application/xml")
             return
         if parsed.path == "/meta/webhook":
@@ -847,7 +1002,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(raw.decode("utf-8") or "{}")
             log_event("meta_webhook", payload)
             for message in extract_meta_messages(payload):
-                reply = handle_answer(message["body"])
+                user = get_or_create_user("meta", message["from"])
+                reply = handle_answer(message["body"], user)
                 send_message(reply, to=message["from"])
                 log_event("meta_reply", {"to": message["from"], "reply": reply, "message_id": message["id"]})
             self.send(200, b"EVENT_RECEIVED", "text/plain")
@@ -861,7 +1017,8 @@ class Handler(BaseHTTPRequestHandler):
             log_event("telegram_webhook", payload)
             message = extract_telegram_message(payload)
             if message:
-                reply = handle_answer(message["body"])
+                user = get_or_create_user("telegram", message["chat_id"])
+                reply = handle_answer(message["body"], user)
                 send_message(reply, to=message["chat_id"])
                 log_event("telegram_reply", {"chat_id": message["chat_id"], "reply": reply, "message_id": message["message_id"]})
             self.send(200, b"OK", "text/plain")
@@ -882,8 +1039,18 @@ def scheduler_loop() -> None:
         try:
             mark_expired()
             enabled = ENV.get("QUIZ_ENABLED", "true").lower() == "true"
-            if enabled and in_quiz_window() and now() >= next_send and not active_prompt():
-                send_quiz_now()
+            if enabled and in_quiz_window() and now() >= next_send:
+                with db() as con:
+                    users = con.execute(
+                        """
+                        SELECT * FROM users
+                        WHERE name IS NOT NULL AND awaiting_name = 0
+                        ORDER BY last_seen_at DESC
+                        """
+                    ).fetchall()
+                for user in users:
+                    if not active_prompt(user["id"]):
+                        send_quiz_now(user["id"], to=user["external_id"])
                 low = int(ENV.get("QUIZ_MIN_GAP_MINUTES", "45"))
                 high = int(ENV.get("QUIZ_MAX_GAP_MINUTES", "180"))
                 next_send = now() + timedelta(minutes=random.randint(low, high))
