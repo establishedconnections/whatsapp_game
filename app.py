@@ -349,24 +349,50 @@ def contains_answer(text: str, prompt: sqlite3.Row) -> bool:
     return any(part and part in normalized for part in answer_parts(prompt["meaning"]))
 
 
-def fallback_hint(prompt: sqlite3.Row) -> str:
+def row_value(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    return row[key] if key in row.keys() else default
+
+
+def fallback_hint_text(prompt: sqlite3.Row) -> str:
     forms = [prompt["imperfectum"], prompt["aoristus"]]
     forms = [form for form in forms if form]
     if forms:
-        return f"Hint: kijk naar de stam in deze vormen: {' / '.join(forms)}."
-    return "Hint: kijk goed naar het begin van het Griekse woord en probeer het woordbeeld te koppelen aan je kaartje."
+        return f"Kijk naar de stam in deze vormen: {' / '.join(forms)}."
+    return "Kijk goed naar het begin van het Griekse woord en probeer het woordbeeld te koppelen aan je kaartje."
+
+
+def save_word_hint(word_id: int, hint_text: str, source: str) -> None:
+    with db() as con:
+        con.execute(
+            """
+            UPDATE words
+            SET hint_text = ?, hint_source = ?, hint_updated_at = ?
+            WHERE id = ?
+            """,
+            (hint_text.strip(), source, dt(now()), word_id),
+        )
 
 
 def ai_hint(prompt: sqlite3.Row) -> str:
-    if not ai_hints_enabled():
-        return fallback_hint(prompt)
-    result = openai_json(ai_context(prompt, "", "hint"))
-    hint = (result or {}).get("hint_dutch", "").strip()
-    if hint and not contains_answer(hint, prompt):
-        return f"Hint: {hint}"
-    if hint:
-        log_event("openai_hint_rejected", {"prompt_id": prompt["id"], "hint": hint[:300]})
-    return fallback_hint(prompt)
+    cached = (row_value(prompt, "hint_text", "") or "").strip()
+    if cached and not contains_answer(cached, prompt):
+        return f"Hint: {cached}"
+
+    hint = ""
+    source = "fallback"
+    if ai_hints_enabled():
+        result = openai_json(ai_context(prompt, "", "hint"))
+        candidate = (result or {}).get("hint_dutch", "").strip()
+        if candidate and not contains_answer(candidate, prompt):
+            hint = candidate
+            source = "openai"
+        elif candidate:
+            log_event("openai_hint_rejected", {"prompt_id": prompt["id"], "hint": candidate[:300]})
+
+    if not hint:
+        hint = fallback_hint_text(prompt)
+    save_word_hint(prompt["word_id"], hint, source)
+    return f"Hint: {hint}"
 
 
 def init_db() -> None:
@@ -384,7 +410,10 @@ def init_db() -> None:
                 correct_count INTEGER NOT NULL DEFAULT 0,
                 wrong_count INTEGER NOT NULL DEFAULT 0,
                 due_at TEXT NOT NULL,
-                last_seen_at TEXT
+                last_seen_at TEXT,
+                hint_text TEXT,
+                hint_source TEXT,
+                hint_updated_at TEXT
             )
             """
         )
@@ -455,13 +484,20 @@ def init_db() -> None:
                 """,
                 (greek, imperfectum, aoristus, meaning, due),
             )
-        columns = {row[1] for row in con.execute("PRAGMA table_info(prompts)")}
-        if "user_id" not in columns:
+        prompt_columns = {row[1] for row in con.execute("PRAGMA table_info(prompts)")}
+        if "user_id" not in prompt_columns:
             con.execute("ALTER TABLE prompts ADD COLUMN user_id INTEGER")
-        if "hint_used" not in columns:
+        if "hint_used" not in prompt_columns:
             con.execute("ALTER TABLE prompts ADD COLUMN hint_used INTEGER NOT NULL DEFAULT 0")
-        if "score" not in columns:
+        if "score" not in prompt_columns:
             con.execute("ALTER TABLE prompts ADD COLUMN score REAL")
+        word_columns = {row[1] for row in con.execute("PRAGMA table_info(words)")}
+        if "hint_text" not in word_columns:
+            con.execute("ALTER TABLE words ADD COLUMN hint_text TEXT")
+        if "hint_source" not in word_columns:
+            con.execute("ALTER TABLE words ADD COLUMN hint_source TEXT")
+        if "hint_updated_at" not in word_columns:
+            con.execute("ALTER TABLE words ADD COLUMN hint_updated_at TEXT")
 
 
 def db() -> sqlite3.Connection:
@@ -561,7 +597,8 @@ def active_prompt(user_id: int) -> sqlite3.Row | None:
     with db() as con:
         return con.execute(
             """
-            SELECT prompts.*, words.greek, words.meaning, words.imperfectum, words.aoristus
+            SELECT prompts.*, words.greek, words.meaning, words.imperfectum, words.aoristus,
+                   words.hint_text, words.hint_source, words.hint_updated_at
             FROM prompts
             JOIN words ON words.id = prompts.word_id
             WHERE prompts.user_id = ? AND answered_at IS NULL
@@ -584,7 +621,8 @@ def create_prompt(user_id: int, word_id: int) -> sqlite3.Row:
         prompt_id = cur.lastrowid
         return con.execute(
             """
-            SELECT prompts.*, words.greek, words.meaning, words.imperfectum, words.aoristus
+            SELECT prompts.*, words.greek, words.meaning, words.imperfectum, words.aoristus,
+                   words.hint_text, words.hint_source, words.hint_updated_at
             FROM prompts
             JOIN words ON words.id = prompts.word_id
             WHERE prompts.id = ?
@@ -1114,6 +1152,16 @@ def stats() -> dict[str, Any]:
             FROM user_words
             """
         ).fetchone()
+        hint_totals = con.execute(
+            """
+            SELECT
+              COUNT(*) AS cached_hints,
+              SUM(CASE WHEN hint_source = 'openai' THEN 1 ELSE 0 END) AS openai_hints,
+              SUM(CASE WHEN hint_source = 'fallback' THEN 1 ELSE 0 END) AS fallback_hints
+            FROM words
+            WHERE hint_text IS NOT NULL AND hint_text <> ''
+            """
+        ).fetchone()
         hardest = con.execute(
             """
             SELECT users.name, users.platform, words.greek, words.meaning,
@@ -1122,7 +1170,7 @@ def stats() -> dict[str, Any]:
             FROM user_words
             JOIN users ON users.id = user_words.user_id
             JOIN words ON words.id = user_words.word_id
-            ORDER BY wrong_count DESC, box ASC, due_at ASC
+            ORDER BY user_words.wrong_count DESC, user_words.box ASC, user_words.due_at ASC
             LIMIT 10
             """
         ).fetchall()
@@ -1139,6 +1187,9 @@ def stats() -> dict[str, Any]:
         "correct": totals["correct"] or 0,
         "wrong": totals["wrong"] or 0,
         "avg_box": round(float(totals["avg_box"] or 0), 2),
+        "cached_hints": hint_totals["cached_hints"] or 0,
+        "openai_hints": hint_totals["openai_hints"] or 0,
+        "fallback_hints": hint_totals["fallback_hints"] or 0,
         "schedule": schedule_status(),
         "users": [dict(row) for row in users],
         "settings": {

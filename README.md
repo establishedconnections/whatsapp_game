@@ -215,6 +215,8 @@ Met `/hint`, `hint`, `tip` of `hulp` krijgt hij een hulpje richting het antwoord
 HINT_SCORE=0.5
 ```
 
+Hints worden per Grieks woord opgeslagen in de database. De eerste hint kan dus via OpenAI gemaakt worden; daarna wordt dezelfde hint goedkoop hergebruikt voor dat woord.
+
 Bij een fout antwoord krijgt hij nu een korte uitleg:
 
 - wat het goede antwoord was
