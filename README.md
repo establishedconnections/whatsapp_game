@@ -1,12 +1,12 @@
-# Griekse Werkwoorden WhatsApp Game
+# Griekse Werkwoorden Quizbot
 
-Een kleine WhatsApp-quizbackend voor de Griekse werkwoordenlijst t/m les 17.
+Een kleine Telegram/WhatsApp-quizbackend voor de Griekse werkwoordenlijst t/m les 17.
 
 ## Wat doet dit?
 
 - Stuurt op ingestelde momenten een Grieks werkwoord naar je zoon.
 - Hij heeft 5 minuten om te antwoorden met de Nederlandse vertaling.
-- De backend geeft direct feedback via WhatsApp.
+- De backend geeft direct feedback via Telegram of WhatsApp.
 - Resultaten worden opgeslagen in SQLite.
 - Woorden die fout gaan komen vaker terug; woorden die goed gaan komen minder vaak.
 - Na elk antwoord vraagt de bot: "Wil je er nog een?"
@@ -14,12 +14,50 @@ Een kleine WhatsApp-quizbackend voor de Griekse werkwoordenlijst t/m les 17.
 - Kleine uitleg na een fout antwoord.
 - Grappige micro-beloningstekst na een goed antwoord.
 
-## Belangrijk voor WhatsApp
+## Aanbevolen: Telegram
 
-Deze backend kan met Twilio of direct met Meta WhatsApp Cloud API werken.
+Voor dit project is Telegram waarschijnlijk de simpelste optie:
 
-WhatsApp/Twilio heeft een 24-uurs sessieregel: buiten 24 uur na het laatste bericht van de gebruiker mag je meestal geen vrij tekstbericht sturen, maar moet je een goedgekeurde WhatsApp-template gebruiken. Daarom ondersteunt deze backend twee manieren:
+- gratis Bot API
+- geen WhatsApp Business-account
+- geen approved templates
+- geen 24-uurs service-window voor geplande quizvragen
+- simpele webhook met HTTPS
 
+Maak een bot via `@BotFather` en zet in `.env`:
+
+```env
+BOT_PROVIDER=telegram
+TELEGRAM_BOT_TOKEN=123456:...
+TELEGRAM_CHAT_ID=
+TELEGRAM_WEBHOOK_SECRET=kies-hier-een-lange-random-string
+```
+
+Laat je zoon eerst `/start` sturen naar de bot. De backend kan dan zijn `chat_id` uit de events loggen; je kunt die invullen als `TELEGRAM_CHAT_ID` voor geplande vragen.
+
+Telegram webhook URL:
+
+```text
+https://whatsapp-game.establishedconnections.com/telegram/webhook
+```
+
+Webhook instellen:
+
+```bash
+curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://whatsapp-game.establishedconnections.com/telegram/webhook","secret_token":"<TELEGRAM_WEBHOOK_SECRET>","allowed_updates":["message"]}'
+```
+
+## WhatsApp opties
+
+Deze backend kan ook met Twilio of direct met Meta WhatsApp Cloud API werken.
+
+WhatsApp heeft een 24-uurs serviceregel: buiten 24 uur na het laatste bericht van de gebruiker mag je meestal geen vrij tekstbericht sturen, maar moet je een goedgekeurde template gebruiken.
+
+Twilio:
+
+- `BOT_PROVIDER=twilio`
 - `TWILIO_CONTENT_SID` leeg: vrije tekstberichten, handig voor sandbox/test en binnen de 24-uurs sessie.
 - `TWILIO_CONTENT_SID` gevuld: geplande quizvragen worden als template verstuurd met variabele `{{1}}` voor het Griekse woord.
 
@@ -34,7 +72,7 @@ De WhatsApp-regel blijft wel hetzelfde: buiten de 24-uurs service window moet je
 Zet in `.env`:
 
 ```env
-WHATSAPP_PROVIDER=meta
+BOT_PROVIDER=meta
 STUDENT_TO=31612345678
 META_GRAPH_VERSION=v25.0
 META_PHONE_NUMBER_ID=...
@@ -100,6 +138,8 @@ GET  /health
 GET  /admin/stats
 POST /admin/send-now
 POST /twilio/inbound
+POST /meta/webhook
+POST /telegram/webhook
 ```
 
 Voor `POST /admin/send-now` kun je leeg posten; de backend kiest dan zelf een woord dat aan de beurt is.
@@ -133,7 +173,7 @@ Handmatige vragen via `/admin/send-now` of antwoorden met `ja` mogen wel meteen 
 
 De leerling mag een deel van de vertaling geven. Bijvoorbeeld bij `leiden, brengen` zijn `leiden` en `brengen` allebei goed.
 
-## WhatsApp spelregels
+## Spelregels
 
 Na elk beantwoord woord krijgt de leerling feedback plus:
 

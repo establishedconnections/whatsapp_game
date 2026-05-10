@@ -397,8 +397,14 @@ def mark_expired() -> int:
     return len(expired)
 
 
+def bot_provider() -> str:
+    return ENV.get("BOT_PROVIDER", ENV.get("WHATSAPP_PROVIDER", "twilio")).strip().lower()
+
+
 def send_message(body: str, template_word: str | None = None, to: str | None = None) -> dict[str, Any]:
-    provider = ENV.get("WHATSAPP_PROVIDER", "twilio").strip().lower()
+    provider = bot_provider()
+    if provider == "telegram":
+        return telegram_send(body, to=to)
     if provider == "meta":
         return meta_send(body, template_word=template_word, to=to)
     return twilio_send(body, template_word=template_word)
@@ -486,6 +492,33 @@ def meta_send(body: str, template_word: str | None = None, to: str | None = None
     return response
 
 
+def telegram_send(body: str, to: str | None = None) -> dict[str, Any]:
+    token = ENV.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = to or ENV.get("TELEGRAM_CHAT_ID", "") or ENV.get("STUDENT_TO", "")
+    if not all([token, chat_id]):
+        log_event("dry_run_telegram_send", {"body": body, "chat_id": chat_id})
+        return {"dry_run": True, "body": body}
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": body,
+        "disable_web_page_preview": True,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urlopen(req, timeout=20) as res:
+            response = json.loads(res.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        log_event("telegram_send_error", {"status": exc.code, "body": error_body, "message": body})
+        raise
+    log_event("telegram_send", {"response": response, "body": body, "chat_id": chat_id})
+    return response
+
+
 def send_quiz_now() -> sqlite3.Row:
     current = active_prompt()
     if current and parse_dt(current["expires_at"]) and parse_dt(current["expires_at"]) > now():
@@ -524,6 +557,29 @@ def extract_meta_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 if text:
                     messages.append({"from": message.get("from", ""), "body": text, "id": message.get("id", "")})
     return messages
+
+
+def verify_telegram_secret(secret: str | None) -> bool:
+    expected = ENV.get("TELEGRAM_WEBHOOK_SECRET", "")
+    if not expected:
+        return True
+    return hmac.compare_digest(secret or "", expected)
+
+
+def extract_telegram_message(payload: dict[str, Any]) -> dict[str, str] | None:
+    message = payload.get("message") or payload.get("edited_message")
+    if not message:
+        return None
+    text = message.get("text", "")
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    if not text or chat_id is None:
+        return None
+    return {
+        "chat_id": str(chat_id),
+        "body": text,
+        "message_id": str(message.get("message_id", "")),
+    }
 
 
 def is_yes(text: str) -> bool:
@@ -774,6 +830,20 @@ class Handler(BaseHTTPRequestHandler):
                 log_event("meta_reply", {"to": message["from"], "reply": reply, "message_id": message["id"]})
             self.send(200, b"EVENT_RECEIVED", "text/plain")
             return
+        if parsed.path == "/telegram/webhook":
+            raw = self.read_body()
+            if not verify_telegram_secret(self.headers.get("X-Telegram-Bot-Api-Secret-Token")):
+                self.send(403, b"forbidden", "text/plain")
+                return
+            payload = json.loads(raw.decode("utf-8") or "{}")
+            log_event("telegram_webhook", payload)
+            message = extract_telegram_message(payload)
+            if message:
+                reply = handle_answer(message["body"])
+                send_message(reply, to=message["chat_id"])
+                log_event("telegram_reply", {"chat_id": message["chat_id"], "reply": reply, "message_id": message["message_id"]})
+            self.send(200, b"OK", "text/plain")
+            return
         self.send(404, json.dumps({"error": "not found"}).encode())
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -807,7 +877,7 @@ def main() -> None:
     port = int(ENV.get("PORT", "8080"))
     threading.Thread(target=scheduler_loop, daemon=True).start()
     server = ThreadingHTTPServer((host, port), Handler)
-    print(f"Greek WhatsApp quiz backend running on http://{host}:{port}")
+    print(f"Greek quiz backend running on http://{host}:{port}")
     print(f"Database: {DB_PATH}")
     server.serve_forever()
 
