@@ -530,6 +530,13 @@ def send_quiz_now() -> sqlite3.Row:
     return prompt
 
 
+def new_quiz_text() -> str:
+    word = choose_word()
+    prompt = create_prompt(word["id"])
+    log_event("prompt_created", {"prompt_id": prompt["id"], "word_id": prompt["word_id"], "greek": prompt["greek"]})
+    return quiz_text(prompt)
+
+
 def twiml(message: str) -> bytes:
     body = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{html.escape(message)}</Message></Response>'
     return body.encode("utf-8")
@@ -583,7 +590,7 @@ def extract_telegram_message(payload: dict[str, Any]) -> dict[str, str] | None:
 
 
 def is_yes(text: str) -> bool:
-    return normalize(text) in {"ja", "j", "yes", "y", "nog een", "meer", "volgende", "door", "quiz"}
+    return normalize(text) in {"ja", "j", "yes", "y", "nog een", "meer", "volgende", "door", "quiz", "start"}
 
 
 def is_no(text: str) -> bool:
@@ -701,16 +708,31 @@ def miss_micro_text() -> str:
 
 
 def handle_answer(text: str) -> str:
+    cleaned = normalize(text)
     prompt = active_prompt()
-    if not prompt:
-        if is_yes(text) or normalize(text) in {"start", "vraag"}:
-            prompt = send_quiz_now()
+
+    if cleaned in {"start", "quiz", "vraag"}:
+        if prompt and parse_dt(prompt["expires_at"]) and parse_dt(prompt["expires_at"]) > now():
             return quiz_text(prompt)
+        if prompt:
+            mark_expired()
+        return new_quiz_text()
+
+    if not prompt:
+        if is_yes(text):
+            return new_quiz_text()
         if is_no(text):
             return "Prima, later weer verder. Stuur 'ja' of 'quiz' als je nog een woord wilt."
-        if normalize(text) in {"status", "score", "beloning"}:
+        if cleaned in {"status", "score", "beloning"}:
             return weekly_progress_text()
         return "Er staat nu geen quizvraag open. Stuur 'ja' of 'quiz' voor een nieuwe vraag, of 'status' voor je weekscore."
+
+    if is_yes(text):
+        return quiz_text(prompt)
+    if is_no(text):
+        return "Prima, later weer verder. Je huidige quizvraag blijft nog even open; stuur de vertaling of later 'quiz' voor een nieuwe vraag."
+    if cleaned in {"status", "score", "beloning"}:
+        return weekly_progress_text()
 
     if parse_dt(prompt["expires_at"]) and parse_dt(prompt["expires_at"]) < now():
         mark_expired()
