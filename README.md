@@ -182,6 +182,19 @@ Handmatige vragen via `/admin/send-now` of antwoorden met `ja` mogen wel meteen 
 
 De leerling mag een deel van de vertaling geven. Bijvoorbeeld bij `leiden, brengen` zijn `leiden` en `brengen` allebei goed.
 
+Optioneel kan de bot OpenAI gebruiken om flexibeler te beoordelen. Dat helpt bij synoniemen die niet letterlijk in de database staan en bij kleine spelfouten. De AI krijgt alleen het huidige quizwoord plus de verwachte vertaling als context en mag alleen een gestructureerd oordeel teruggeven; scores en database-updates blijven in de backend-code.
+
+```env
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-5.5
+AI_GRADING_ENABLED=true
+AI_HINTS_ENABLED=true
+AI_MIN_CONFIDENCE=0.72
+OPENAI_TIMEOUT_SECONDS=8
+```
+
+Als OpenAI uit staat of faalt, valt de bot automatisch terug op de gewone database-check.
+
 ## Spelregels
 
 Na elk beantwoord woord krijgt de leerling feedback plus:
@@ -195,6 +208,12 @@ Als hij `ja`, `quiz`, `meer`, `volgende` of `nog een` stuurt, krijgt hij meteen 
 Als hij `nee`, `stop`, `klaar` of `later` stuurt, stopt de speelsessie rustig.
 
 Met `status`, `score` of `beloning` krijgt hij de weekscore te zien.
+
+Met `/hint`, `hint`, `tip` of `hulp` krijgt hij een hulpje richting het antwoord, zonder dat het antwoord letterlijk verklapt wordt. Een goed antwoord na een hint telt standaard voor een half punt in de weekscore:
+
+```env
+HINT_SCORE=0.5
+```
 
 Bij een fout antwoord krijgt hij nu een korte uitleg:
 
@@ -228,3 +247,4 @@ REWARD_90=t-shirt
 ```
 
 Het percentage telt zodra er minstens `WEEKLY_GOAL_MIN_ANSWERS` woorden in die week zijn beantwoord. De week begint op maandag.
+De weekscore rekent met punten: goed zonder hint is 1 punt, goed na een hint is `HINT_SCORE`, fout is 0.
