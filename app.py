@@ -462,6 +462,7 @@ def init_db() -> None:
                 hint_used INTEGER NOT NULL DEFAULT 0,
                 score REAL,
                 mode TEXT NOT NULL DEFAULT 'toets',
+                choices_json TEXT,
                 FOREIGN KEY(word_id) REFERENCES words(id)
             )
             """
@@ -495,6 +496,8 @@ def init_db() -> None:
             con.execute("ALTER TABLE prompts ADD COLUMN score REAL")
         if "mode" not in prompt_columns:
             con.execute("ALTER TABLE prompts ADD COLUMN mode TEXT NOT NULL DEFAULT 'toets'")
+        if "choices_json" not in prompt_columns:
+            con.execute("ALTER TABLE prompts ADD COLUMN choices_json TEXT")
         user_columns = {row[1] for row in con.execute("PRAGMA table_info(users)")}
         if "last_mode" not in user_columns:
             con.execute("ALTER TABLE users ADD COLUMN last_mode TEXT NOT NULL DEFAULT 'toets'")
@@ -665,14 +668,35 @@ def active_prompt(user_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def create_choices(con: sqlite3.Connection, word_id: int) -> list[dict[str, Any]]:
+    correct = con.execute("SELECT id, meaning FROM words WHERE id = ?", (word_id,)).fetchone()
+    distractors = con.execute(
+        """
+        SELECT id, meaning
+        FROM words
+        WHERE id <> ?
+        ORDER BY RANDOM()
+        LIMIT 3
+        """,
+        (word_id,),
+    ).fetchall()
+    options = [{"word_id": correct["id"], "meaning": correct["meaning"], "correct": True}]
+    options.extend({"word_id": row["id"], "meaning": row["meaning"], "correct": False} for row in distractors)
+    random.shuffle(options)
+    for label, option in zip(["A", "B", "C", "D"], options):
+        option["label"] = label
+    return options
+
+
 def create_prompt(user_id: int, word_id: int, mode: str = "toets") -> sqlite3.Row:
     timeout = int(ENV.get("ANSWER_TIMEOUT_MINUTES", "5"))
     sent = now()
     expires = sent + timedelta(minutes=timeout)
     with db() as con:
+        choices_json = json.dumps(create_choices(con, word_id), ensure_ascii=False) if mode == "uitleg" else None
         cur = con.execute(
-            "INSERT INTO prompts(user_id, word_id, sent_at, expires_at, mode) VALUES (?, ?, ?, ?, ?)",
-            (user_id, word_id, dt(sent), dt(expires), mode),
+            "INSERT INTO prompts(user_id, word_id, sent_at, expires_at, mode, choices_json) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, word_id, dt(sent), dt(expires), mode, choices_json),
         )
         prompt_id = cur.lastrowid
         return con.execute(
@@ -690,8 +714,32 @@ def create_prompt(user_id: int, word_id: int, mode: str = "toets") -> sqlite3.Ro
 def quiz_text(prompt: sqlite3.Row) -> str:
     mins = ENV.get("ANSWER_TIMEOUT_MINUTES", "5")
     if row_value(prompt, "mode", "toets") == "uitleg":
+        choices = prompt_choices(prompt)
+        if choices:
+            options = "\n".join(f"{choice['label']}. {choice['meaning']}" for choice in choices)
+            return f"Uitlegwoord: {prompt['greek']}\nKies het beste antwoord. Dit telt niet mee voor je score.\n{options}"
         return f"Uitlegwoord: {prompt['greek']}\nProbeer de Nederlandse vertaling. Dit telt niet mee voor je score."
     return f"Toetswoord: {prompt['greek']}\nWat is de Nederlandse vertaling? Je hebt {mins} minuten."
+
+
+def prompt_choices(prompt: sqlite3.Row) -> list[dict[str, Any]]:
+    raw = row_value(prompt, "choices_json", "")
+    if not raw:
+        return []
+    try:
+        choices = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return choices if isinstance(choices, list) else []
+
+
+def selected_choice(prompt: sqlite3.Row, answer: str) -> dict[str, Any] | None:
+    cleaned = normalize(answer).upper()
+    match = re.match(r"^([ABCD])(?:\b|$)", cleaned)
+    if not match:
+        return None
+    label = match.group(1)
+    return next((choice for choice in prompt_choices(prompt) if choice.get("label") == label), None)
 
 
 def hint_score() -> float:
@@ -1226,9 +1274,11 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
             """,
             (prompt["id"],),
         ).fetchone()
-    correct = is_correct(text, prompt["meaning"])
+    mode = row_value(prompt, "mode", "toets")
+    choice = selected_choice(prompt, text) if mode == "uitleg" else None
+    correct = bool(choice and choice.get("correct")) if choice else is_correct(text, prompt["meaning"])
     ai_result = None
-    if not correct:
+    if not correct and not choice:
         ai_result = ai_grade_answer(prompt, text)
         if (
             ai_result
@@ -1236,13 +1286,15 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
             and float(ai_result.get("confidence", 0)) >= ai_min_confidence()
         ):
             correct = True
-    mode = row_value(prompt, "mode", "toets")
     set_user_mode(user["id"], mode)
     if mode == "uitleg":
         record_unscored_answer(prompt, text, correct)
         ai_note = ""
         if ai_result and ai_result.get("reason_dutch"):
             ai_note = f"\nIk snap je gedachte: {ai_result['reason_dutch']}"
+        if choice:
+            selected = f"\nJouw keuze: {choice['label']}. {choice['meaning']}"
+            ai_note = selected + ai_note
         verdict = "Mooi, dat klopt." if correct else f"Nog niet helemaal. {miss_micro_text()}"
         return f"{verdict}{ai_note}\nDit telt niet mee voor je score.\n{prompt['greek']} = {prompt['meaning']}.\n{explanation(prompt)}\n{ai_hint(prompt)}\n{ask_more_text_for_mode(mode)}"
 

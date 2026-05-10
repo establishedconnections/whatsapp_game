@@ -206,7 +206,7 @@ Wil je er nog een? Antwoord met ja of nee.
 Er zijn twee modi:
 
 - `/toets`: echte toetsmodus. Antwoorden tellen mee voor score, beloningen en herhalingsschema.
-- `/uitleg`: oefenmodus op recente fouten uit de toets. Antwoorden tellen niet mee; de bot legt het woord extra uit met hint en vormen.
+- `/uitleg`: oefenmodus op recente fouten uit de toets. Antwoorden tellen niet mee; de bot begint speels met multiple choice en legt daarna het woord extra uit met hint en vormen.
 
 `quiz` blijft als oude alias voor `/toets` werken. Als hij `ja`, `meer`, `volgende` of `nog een` stuurt, krijgt hij meteen een nieuw woord in dezelfde modus als net gebruikt.
 
