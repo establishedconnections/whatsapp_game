@@ -16,7 +16,7 @@ Een kleine WhatsApp-quizbackend voor de Griekse werkwoordenlijst t/m les 17.
 
 ## Belangrijk voor WhatsApp
 
-Deze backend is gemaakt voor Twilio WhatsApp webhooks.
+Deze backend kan met Twilio of direct met Meta WhatsApp Cloud API werken.
 
 WhatsApp/Twilio heeft een 24-uurs sessieregel: buiten 24 uur na het laatste bericht van de gebruiker mag je meestal geen vrij tekstbericht sturen, maar moet je een goedgekeurde WhatsApp-template gebruiken. Daarom ondersteunt deze backend twee manieren:
 
@@ -24,6 +24,45 @@ WhatsApp/Twilio heeft een 24-uurs sessieregel: buiten 24 uur na het laatste beri
 - `TWILIO_CONTENT_SID` gevuld: geplande quizvragen worden als template verstuurd met variabele `{{1}}` voor het Griekse woord.
 
 Feedback na een antwoord kan normaal als vrij bericht, omdat de leerling dan net zelf heeft gereageerd.
+
+## Direct Meta WhatsApp Cloud API
+
+Meta Cloud API is meestal fijner dan de Twilio Sandbox voor langdurig gebruik: geen sandbox join-code, geen Twilio tussenlaag, en je werkt direct met je WhatsApp Business phone number.
+
+De WhatsApp-regel blijft wel hetzelfde: buiten de 24-uurs service window moet je een goedgekeurde template gebruiken. Binnen die window mag vrije tekst.
+
+Zet in `.env`:
+
+```env
+WHATSAPP_PROVIDER=meta
+STUDENT_TO=31612345678
+META_GRAPH_VERSION=v25.0
+META_PHONE_NUMBER_ID=...
+META_ACCESS_TOKEN=...
+META_VERIFY_TOKEN=kies-hier-een-lange-random-string
+META_APP_SECRET=...
+```
+
+In Meta Developers configureer je de webhook callback URL:
+
+```text
+https://whatsapp-game.establishedconnections.com/meta/webhook
+```
+
+Gebruik dezelfde waarde voor Verify Token als `META_VERIFY_TOKEN`.
+
+Subscribe op WhatsApp webhook events voor incoming messages. Voor geplande quizvragen buiten de 24-uurs window maak je een approved template aan, bijvoorbeeld:
+
+```text
+Grieks quizwoord: {{1}}. Wat is de Nederlandse vertaling?
+```
+
+Daarna zet je:
+
+```env
+META_TEMPLATE_NAME=naam_van_je_template
+META_TEMPLATE_LANGUAGE=nl
+```
 
 ## Starten
 

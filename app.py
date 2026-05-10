@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import html
+import hashlib
 import json
 import os
 import random
@@ -12,7 +14,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -394,6 +397,13 @@ def mark_expired() -> int:
     return len(expired)
 
 
+def send_message(body: str, template_word: str | None = None, to: str | None = None) -> dict[str, Any]:
+    provider = ENV.get("WHATSAPP_PROVIDER", "twilio").strip().lower()
+    if provider == "meta":
+        return meta_send(body, template_word=template_word, to=to)
+    return twilio_send(body, template_word=template_word)
+
+
 def twilio_send(body: str, template_word: str | None = None) -> dict[str, Any]:
     sid = ENV.get("TWILIO_ACCOUNT_SID", "")
     token = ENV.get("TWILIO_AUTH_TOKEN", "")
@@ -423,13 +433,66 @@ def twilio_send(body: str, template_word: str | None = None) -> dict[str, Any]:
     return payload
 
 
+def meta_send(body: str, template_word: str | None = None, to: str | None = None) -> dict[str, Any]:
+    phone_number_id = ENV.get("META_PHONE_NUMBER_ID", "")
+    access_token = ENV.get("META_ACCESS_TOKEN", "")
+    to = to or ENV.get("STUDENT_TO", "")
+    if to.startswith("whatsapp:"):
+        to = to.replace("whatsapp:", "", 1)
+    to = re.sub(r"[^\d+]", "", to)
+    if not all([phone_number_id, access_token, to]):
+        log_event("dry_run_meta_send", {"body": body, "template_word": template_word})
+        return {"dry_run": True, "body": body}
+
+    version = ENV.get("META_GRAPH_VERSION", "v25.0")
+    url = f"https://graph.facebook.com/{version}/{phone_number_id}/messages"
+    template_name = ENV.get("META_TEMPLATE_NAME", "")
+    if template_name and template_word:
+        payload: dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": ENV.get("META_TEMPLATE_LANGUAGE", "nl")},
+                "components": [
+                    {
+                        "type": "body",
+                        "parameters": [{"type": "text", "text": template_word}],
+                    }
+                ],
+            },
+        }
+    else:
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to,
+            "type": "text",
+            "text": {"preview_url": False, "body": body},
+        }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"Bearer {access_token}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urlopen(req, timeout=20) as res:
+            response = json.loads(res.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        log_event("meta_send_error", {"status": exc.code, "body": error_body, "message": body})
+        raise
+    log_event("meta_send", {"response": response, "body": body})
+    return response
+
+
 def send_quiz_now() -> sqlite3.Row:
     current = active_prompt()
     if current and parse_dt(current["expires_at"]) and parse_dt(current["expires_at"]) > now():
         return current
     word = choose_word()
     prompt = create_prompt(word["id"])
-    twilio_send(quiz_text(prompt), template_word=prompt["greek"])
+    send_message(quiz_text(prompt), template_word=prompt["greek"])
     log_event("prompt_sent", {"prompt_id": prompt["id"], "word_id": prompt["word_id"], "greek": prompt["greek"]})
     return prompt
 
@@ -437,6 +500,30 @@ def send_quiz_now() -> sqlite3.Row:
 def twiml(message: str) -> bytes:
     body = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{html.escape(message)}</Message></Response>'
     return body.encode("utf-8")
+
+
+def verify_meta_signature(raw_body: bytes, signature: str | None) -> bool:
+    app_secret = ENV.get("META_APP_SECRET", "")
+    if not app_secret:
+        return True
+    if not signature or not signature.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(app_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def extract_meta_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            for message in value.get("messages", []):
+                text = ""
+                if message.get("type") == "text":
+                    text = message.get("text", {}).get("body", "")
+                if text:
+                    messages.append({"from": message.get("from", ""), "body": text, "id": message.get("id", "")})
+    return messages
 
 
 def is_yes(text: str) -> bool:
@@ -643,25 +730,49 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
             self.send(200, json.dumps({"ok": True, "time": dt(now())}).encode())
-        elif self.path == "/admin/stats":
+        elif parsed.path == "/admin/stats":
             self.send(200, json.dumps(stats(), ensure_ascii=False, indent=2).encode())
+        elif parsed.path == "/meta/webhook":
+            query = parse_qs(parsed.query)
+            mode = query.get("hub.mode", [""])[0]
+            token = query.get("hub.verify_token", [""])[0]
+            challenge = query.get("hub.challenge", [""])[0]
+            if mode == "subscribe" and token == ENV.get("META_VERIFY_TOKEN", ""):
+                self.send(200, challenge.encode("utf-8"), "text/plain")
+            else:
+                self.send(403, b"forbidden", "text/plain")
         else:
             self.send(404, json.dumps({"error": "not found"}).encode())
 
     def do_POST(self) -> None:
-        if self.path == "/admin/send-now":
+        parsed = urlparse(self.path)
+        if parsed.path == "/admin/send-now":
             prompt = send_quiz_now()
             self.send(200, json.dumps({"sent": True, "prompt": dict(prompt)}, ensure_ascii=False).encode())
             return
-        if self.path == "/twilio/inbound":
+        if parsed.path == "/twilio/inbound":
             data = parse_qs(self.read_body().decode("utf-8"))
             text = data.get("Body", [""])[0]
             from_ = data.get("From", [""])[0]
             log_event("inbound", {"from": from_, "body": text})
             reply = handle_answer(text)
             self.send(200, twiml(reply), "application/xml")
+            return
+        if parsed.path == "/meta/webhook":
+            raw = self.read_body()
+            if not verify_meta_signature(raw, self.headers.get("X-Hub-Signature-256")):
+                self.send(403, b"forbidden", "text/plain")
+                return
+            payload = json.loads(raw.decode("utf-8") or "{}")
+            log_event("meta_webhook", payload)
+            for message in extract_meta_messages(payload):
+                reply = handle_answer(message["body"])
+                send_message(reply, to=message["from"])
+                log_event("meta_reply", {"to": message["from"], "reply": reply, "message_id": message["id"]})
+            self.send(200, b"EVENT_RECEIVED", "text/plain")
             return
         self.send(404, json.dumps({"error": "not found"}).encode())
 
