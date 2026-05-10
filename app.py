@@ -1,0 +1,705 @@
+from __future__ import annotations
+
+import base64
+import html
+import json
+import os
+import random
+import re
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlencode
+from urllib.request import Request, urlopen
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    from words import MNEM, ROWS
+except ModuleNotFoundError:
+    from .words import MNEM, ROWS
+
+
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = APP_DIR / "quiz.sqlite3"
+
+
+def load_env() -> dict[str, str]:
+    env = dict(os.environ)
+    path = APP_DIR / ".env"
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env.setdefault(key.strip(), value.strip())
+    return env
+
+
+ENV = load_env()
+
+
+def now() -> datetime:
+    return datetime.now()
+
+
+def dt(value: datetime) -> str:
+    return value.isoformat(timespec="seconds")
+
+
+def parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
+
+
+DAY_ALIASES = {
+    "mon": 0,
+    "ma": 0,
+    "monday": 0,
+    "tue": 1,
+    "di": 1,
+    "tuesday": 1,
+    "wed": 2,
+    "wo": 2,
+    "wednesday": 2,
+    "thu": 3,
+    "do": 3,
+    "thursday": 3,
+    "fri": 4,
+    "vr": 4,
+    "friday": 4,
+    "sat": 5,
+    "za": 5,
+    "saturday": 5,
+    "sun": 6,
+    "zo": 6,
+    "sunday": 6,
+}
+
+
+def parse_time(value: str) -> tuple[int, int]:
+    hour, minute = value.strip().split(":", 1)
+    return int(hour), int(minute)
+
+
+def minutes(value: str) -> int:
+    hour, minute = parse_time(value)
+    return hour * 60 + minute
+
+
+def time_in_range(current: str, start: str, end: str) -> bool:
+    cur = minutes(current)
+    lo = minutes(start)
+    hi = minutes(end)
+    if lo <= hi:
+        return lo <= cur <= hi
+    return cur >= lo or cur <= hi
+
+
+def expand_days(spec: str) -> set[int]:
+    days: set[int] = set()
+    spec = spec.strip().lower()
+    if not spec or spec in {"all", "alle", "*"}:
+        return set(range(7))
+    for part in re.split(r"[,/]+", spec):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = [p.strip() for p in part.split("-", 1)]
+            if start in DAY_ALIASES and end in DAY_ALIASES:
+                s = DAY_ALIASES[start]
+                e = DAY_ALIASES[end]
+                if s <= e:
+                    days.update(range(s, e + 1))
+                else:
+                    days.update(range(s, 7))
+                    days.update(range(0, e + 1))
+        elif part in DAY_ALIASES:
+            days.add(DAY_ALIASES[part])
+    return days
+
+
+def scheduled_days() -> set[int]:
+    return expand_days(ENV.get("QUIZ_DAYS", "mon,tue,wed,thu,fri,sat,sun"))
+
+
+def block_windows() -> list[tuple[set[int], str, str]]:
+    windows: list[tuple[set[int], str, str]] = []
+    raw = ENV.get("QUIZ_BLOCK_WINDOWS", "")
+    for item in raw.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split()
+        if len(parts) == 1:
+            day_spec = "all"
+            time_spec = parts[0]
+        else:
+            day_spec = parts[0]
+            time_spec = parts[1]
+        if "-" not in time_spec:
+            continue
+        start, end = [p.strip() for p in time_spec.split("-", 1)]
+        windows.append((expand_days(day_spec), start, end))
+    return windows
+
+
+def schedule_status(at: datetime | None = None) -> dict[str, Any]:
+    at = at or now()
+    current_day = at.weekday()
+    current_time = at.strftime("%H:%M")
+    if current_day not in scheduled_days():
+        return {"allowed": False, "reason": "vandaag staat uit"}
+    start = ENV.get("QUIZ_WINDOW_START", "07:30")
+    end = ENV.get("QUIZ_WINDOW_END", "20:30")
+    if not time_in_range(current_time, start, end):
+        return {"allowed": False, "reason": f"buiten speeltijd {start}-{end}"}
+    for days, block_start, block_end in block_windows():
+        if current_day in days and time_in_range(current_time, block_start, block_end):
+            return {"allowed": False, "reason": f"geblokkeerd {block_start}-{block_end}"}
+    return {"allowed": True, "reason": "aan"}
+
+
+def normalize(text: str) -> str:
+    text = text.lower()
+    text = text.replace("(+dat.)", "").replace("(+dat)", "").replace("(+gen.)", "")
+    text = re.sub(r"\([^)]*\)", "", text)
+    text = re.sub(r"[^a-zà-ÿ0-9\s,;]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def answer_parts(meaning: str) -> list[str]:
+    raw_parts = re.split(r"[,;]", meaning)
+    parts: list[str] = []
+    for part in raw_parts:
+        clean = normalize(part)
+        clean = re.sub(r"^(1|2)\s+", "", clean).strip()
+        if clean:
+            parts.append(clean)
+    return parts
+
+
+def is_correct(answer: str, meaning: str) -> bool:
+    given = normalize(answer)
+    if not given:
+        return False
+    parts = answer_parts(meaning)
+    return any(given == part or given in part or part in given for part in parts)
+
+
+def explanation(row: sqlite3.Row) -> str:
+    accepted = ", ".join(answer_parts(row["meaning"]))
+    forms = [
+        f"praesens: {row['greek']}",
+        f"imperfectum: {row['imperfectum'] or '-'}",
+        f"aoristus: {row['aoristus'] or '-'}",
+    ]
+    tip = f"Tip: ik accepteer o.a. {accepted}."
+    mnemonic = MNEM.get(row["greek"])
+    if mnemonic:
+        tip += f" Ezelsbrug: {mnemonic}"
+    return f"{tip}\nKern: {row['greek']} = {row['meaning']}.\n" + " | ".join(forms)
+
+
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS words (
+                id INTEGER PRIMARY KEY,
+                greek TEXT NOT NULL UNIQUE,
+                imperfectum TEXT,
+                aoristus TEXT,
+                meaning TEXT NOT NULL,
+                box INTEGER NOT NULL DEFAULT 0,
+                correct_count INTEGER NOT NULL DEFAULT 0,
+                wrong_count INTEGER NOT NULL DEFAULT 0,
+                due_at TEXT NOT NULL,
+                last_seen_at TEXT
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prompts (
+                id INTEGER PRIMARY KEY,
+                word_id INTEGER NOT NULL,
+                sent_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                answered_at TEXT,
+                answer TEXT,
+                correct INTEGER,
+                FOREIGN KEY(word_id) REFERENCES words(id)
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        due = dt(now())
+        for greek, imperfectum, aoristus, meaning in ROWS:
+            con.execute(
+                """
+                INSERT OR IGNORE INTO words
+                    (greek, imperfectum, aoristus, meaning, due_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (greek, imperfectum, aoristus, meaning, due),
+            )
+
+
+def db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def log_event(kind: str, payload: dict[str, Any]) -> None:
+    with db() as con:
+        con.execute(
+            "INSERT INTO events(created_at, kind, payload) VALUES (?, ?, ?)",
+            (dt(now()), kind, json.dumps(payload, ensure_ascii=False)),
+        )
+
+
+def choose_word() -> sqlite3.Row:
+    with db() as con:
+        due_rows = con.execute(
+            "SELECT * FROM words WHERE due_at <= ? ORDER BY due_at ASC",
+            (dt(now()),),
+        ).fetchall()
+        rows = due_rows or con.execute("SELECT * FROM words ORDER BY due_at ASC LIMIT 10").fetchall()
+    weighted: list[sqlite3.Row] = []
+    for row in rows:
+        weight = max(1, 6 - row["box"]) + row["wrong_count"] * 2
+        weighted.extend([row] * weight)
+    return random.choice(weighted)
+
+
+def active_prompt() -> sqlite3.Row | None:
+    with db() as con:
+        return con.execute(
+            """
+            SELECT prompts.*, words.greek, words.meaning, words.imperfectum, words.aoristus
+            FROM prompts
+            JOIN words ON words.id = prompts.word_id
+            WHERE answered_at IS NULL
+            ORDER BY sent_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+
+def create_prompt(word_id: int) -> sqlite3.Row:
+    timeout = int(ENV.get("ANSWER_TIMEOUT_MINUTES", "5"))
+    sent = now()
+    expires = sent + timedelta(minutes=timeout)
+    with db() as con:
+        cur = con.execute(
+            "INSERT INTO prompts(word_id, sent_at, expires_at) VALUES (?, ?, ?)",
+            (word_id, dt(sent), dt(expires)),
+        )
+        prompt_id = cur.lastrowid
+        return con.execute(
+            """
+            SELECT prompts.*, words.greek, words.meaning, words.imperfectum, words.aoristus
+            FROM prompts
+            JOIN words ON words.id = prompts.word_id
+            WHERE prompts.id = ?
+            """,
+            (prompt_id,),
+        ).fetchone()
+
+
+def quiz_text(prompt: sqlite3.Row) -> str:
+    mins = ENV.get("ANSWER_TIMEOUT_MINUTES", "5")
+    return f"Grieks quizwoord: {prompt['greek']}\nWat is de Nederlandse vertaling? Je hebt {mins} minuten."
+
+
+def update_word_after_answer(prompt: sqlite3.Row, answer: str, correct: bool) -> None:
+    intervals = {
+        0: timedelta(minutes=10),
+        1: timedelta(minutes=30),
+        2: timedelta(hours=4),
+        3: timedelta(days=1),
+        4: timedelta(days=3),
+        5: timedelta(days=7),
+    }
+    old_box = int(prompt["box"]) if "box" in prompt.keys() else 0
+    new_box = min(5, old_box + 1) if correct else max(0, old_box - 1)
+    due_at = now() + (intervals[new_box] if correct else timedelta(minutes=10))
+    with db() as con:
+        con.execute(
+            """
+            UPDATE prompts
+            SET answered_at = ?, answer = ?, correct = ?
+            WHERE id = ?
+            """,
+            (dt(now()), answer, 1 if correct else 0, prompt["id"]),
+        )
+        con.execute(
+            """
+            UPDATE words
+            SET box = ?,
+                correct_count = correct_count + ?,
+                wrong_count = wrong_count + ?,
+                due_at = ?,
+                last_seen_at = ?
+            WHERE id = ?
+            """,
+            (new_box, 1 if correct else 0, 0 if correct else 1, dt(due_at), dt(now()), prompt["word_id"]),
+        )
+
+
+def mark_expired() -> int:
+    expired: list[sqlite3.Row]
+    with db() as con:
+        expired = con.execute(
+            """
+            SELECT prompts.*, words.box
+            FROM prompts
+            JOIN words ON words.id = prompts.word_id
+            WHERE answered_at IS NULL AND expires_at < ?
+            """,
+            (dt(now()),),
+        ).fetchall()
+        for prompt in expired:
+            new_box = max(0, int(prompt["box"]) - 1)
+            con.execute(
+                "UPDATE prompts SET answered_at = ?, answer = ?, correct = 0 WHERE id = ?",
+                (dt(now()), "[geen antwoord binnen 5 minuten]", prompt["id"]),
+            )
+            con.execute(
+                """
+                UPDATE words
+                SET box = ?, wrong_count = wrong_count + 1, due_at = ?, last_seen_at = ?
+                WHERE id = ?
+                """,
+                (new_box, dt(now() + timedelta(minutes=10)), dt(now()), prompt["word_id"]),
+            )
+    return len(expired)
+
+
+def twilio_send(body: str, template_word: str | None = None) -> dict[str, Any]:
+    sid = ENV.get("TWILIO_ACCOUNT_SID", "")
+    token = ENV.get("TWILIO_AUTH_TOKEN", "")
+    from_ = ENV.get("TWILIO_FROM", "")
+    to = ENV.get("STUDENT_TO", "")
+    if not all([sid, token, from_, to]):
+        log_event("dry_run_send", {"body": body, "template_word": template_word})
+        return {"dry_run": True, "body": body}
+
+    params: dict[str, str] = {"From": from_, "To": to}
+    content_sid = ENV.get("TWILIO_CONTENT_SID", "")
+    if content_sid and template_word:
+        params["ContentSid"] = content_sid
+        params["ContentVariables"] = json.dumps({"1": template_word}, ensure_ascii=False)
+    else:
+        params["Body"] = body
+
+    data = urlencode(params).encode("utf-8")
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+    auth = base64.b64encode(f"{sid}:{token}".encode()).decode()
+    req = Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"Basic {auth}")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urlopen(req, timeout=20) as res:
+        payload = json.loads(res.read().decode("utf-8"))
+    log_event("twilio_send", {"sid": payload.get("sid"), "status": payload.get("status"), "body": body})
+    return payload
+
+
+def send_quiz_now() -> sqlite3.Row:
+    current = active_prompt()
+    if current and parse_dt(current["expires_at"]) and parse_dt(current["expires_at"]) > now():
+        return current
+    word = choose_word()
+    prompt = create_prompt(word["id"])
+    twilio_send(quiz_text(prompt), template_word=prompt["greek"])
+    log_event("prompt_sent", {"prompt_id": prompt["id"], "word_id": prompt["word_id"], "greek": prompt["greek"]})
+    return prompt
+
+
+def twiml(message: str) -> bytes:
+    body = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{html.escape(message)}</Message></Response>'
+    return body.encode("utf-8")
+
+
+def is_yes(text: str) -> bool:
+    return normalize(text) in {"ja", "j", "yes", "y", "nog een", "meer", "volgende", "door", "quiz"}
+
+
+def is_no(text: str) -> bool:
+    return normalize(text) in {"nee", "n", "no", "stop", "klaar", "later"}
+
+
+def week_start(at: datetime | None = None) -> datetime:
+    at = at or now()
+    start = at - timedelta(days=at.weekday())
+    return start.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def reward_tiers() -> list[tuple[int, str]]:
+    return [
+        (60, ENV.get("REWARD_60", "ijsje")),
+        (75, ENV.get("REWARD_75", "bios-bezoek")),
+        (90, ENV.get("REWARD_90", "t-shirt")),
+    ]
+
+
+def weekly_progress() -> dict[str, Any]:
+    start = week_start()
+    with db() as con:
+        row = con.execute(
+            """
+            SELECT
+              COUNT(*) AS answered,
+              SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) AS correct
+            FROM prompts
+            WHERE answered_at IS NOT NULL
+              AND correct IS NOT NULL
+              AND answered_at >= ?
+            """,
+            (dt(start),),
+        ).fetchone()
+    answered = int(row["answered"] or 0)
+    correct = int(row["correct"] or 0)
+    pct = round((correct / answered) * 100) if answered else 0
+    minimum = int(ENV.get("WEEKLY_GOAL_MIN_ANSWERS", "10"))
+    earned = None
+    next_tier = None
+    if answered >= minimum:
+        for threshold, reward in reward_tiers():
+            if pct >= threshold:
+                earned = {"threshold": threshold, "reward": reward}
+            elif next_tier is None:
+                next_tier = {"threshold": threshold, "reward": reward}
+    else:
+        next_tier = {"threshold": 60, "reward": ENV.get("REWARD_60", "ijsje")}
+    return {
+        "week_start": dt(start),
+        "answered": answered,
+        "correct": correct,
+        "percent": pct,
+        "minimum": minimum,
+        "earned": earned,
+        "next": next_tier,
+    }
+
+
+def weekly_progress_text() -> str:
+    progress = weekly_progress()
+    base = f"Weekscore: {progress['correct']}/{progress['answered']} goed ({progress['percent']}%)."
+    if progress["answered"] < progress["minimum"]:
+        left = progress["minimum"] - progress["answered"]
+        return f"{base} Nog {left} woorden tot het weekdoel meetelt."
+    if progress["earned"]:
+        text = f"{base} Beloning nu: {progress['earned']['reward']}."
+        if progress["next"]:
+            text += f" Volgende: {progress['next']['reward']} bij {progress['next']['threshold']}%."
+        return text
+    next_tier = progress["next"]
+    return f"{base} Eerste beloning: {next_tier['reward']} bij {next_tier['threshold']}%."
+
+
+def ask_more_text() -> str:
+    return "Wil je er nog een? Antwoord met ja of nee."
+
+
+def configured_lines(key: str, fallback: list[str]) -> list[str]:
+    raw = ENV.get(key, "")
+    if not raw.strip():
+        return fallback
+    lines = [line.strip() for line in raw.split("|") if line.strip()]
+    return lines or fallback
+
+
+def success_micro_reward() -> str:
+    lines = configured_lines(
+        "GOOD_MICRO_REWARDS",
+        [
+            "Mini-beloning: Grieks brein unlocked.",
+            "Meme-modus: professor vibes intensify.",
+            "Dat antwoord kwam binnen als een perfecte worp.",
+            "De oude Grieken zouden zachtjes applaudisseren.",
+            "Level up. Woord verslagen.",
+            "Correct. Je geheugen deed even een heldendaad.",
+            "Hup, deze mag op de denkbeeldige trofee-plank.",
+        ],
+    )
+    return random.choice(lines)
+
+
+def miss_micro_text() -> str:
+    lines = configured_lines(
+        "MISS_MICRO_TEXTS",
+        [
+            "Geen drama, dit is precies hoe herhalen werkt.",
+            "Bijna. Dit woord komt gewoon nog een keer langs.",
+            "Even bijschaven en straks pak je hem wel.",
+            "Deze gaat op de revanche-lijst.",
+        ],
+    )
+    return random.choice(lines)
+
+
+def handle_answer(text: str) -> str:
+    prompt = active_prompt()
+    if not prompt:
+        if is_yes(text) or normalize(text) in {"start", "vraag"}:
+            prompt = send_quiz_now()
+            return quiz_text(prompt)
+        if is_no(text):
+            return "Prima, later weer verder. Stuur 'ja' of 'quiz' als je nog een woord wilt."
+        if normalize(text) in {"status", "score", "beloning"}:
+            return weekly_progress_text()
+        return "Er staat nu geen quizvraag open. Stuur 'ja' of 'quiz' voor een nieuwe vraag, of 'status' voor je weekscore."
+
+    if parse_dt(prompt["expires_at"]) and parse_dt(prompt["expires_at"]) < now():
+        mark_expired()
+        return f"Net te laat. Het antwoord was: {prompt['meaning']}.\n{weekly_progress_text()}\n{ask_more_text()}"
+
+    with db() as con:
+        prompt = con.execute(
+            """
+            SELECT prompts.*, words.*, prompts.id AS id
+            FROM prompts
+            JOIN words ON words.id = prompts.word_id
+            WHERE prompts.id = ?
+            """,
+            (prompt["id"],),
+        ).fetchone()
+    correct = is_correct(text, prompt["meaning"])
+    update_word_after_answer(prompt, text, correct)
+    if correct:
+        return f"Goed! ✅\n{prompt['greek']} = {prompt['meaning']}\n{success_micro_reward()}\n{weekly_progress_text()}\n{ask_more_text()}"
+    return f"Bijna, maar niet goed. {miss_micro_text()}\nHet juiste antwoord is: {prompt['meaning']}.\n{explanation(prompt)}\n{weekly_progress_text()}\n{ask_more_text()}"
+
+
+def stats() -> dict[str, Any]:
+    with db() as con:
+        totals = con.execute(
+            """
+            SELECT
+              COUNT(*) AS words,
+              SUM(correct_count) AS correct,
+              SUM(wrong_count) AS wrong,
+              AVG(box) AS avg_box
+            FROM words
+            """
+        ).fetchone()
+        hardest = con.execute(
+            """
+            SELECT greek, meaning, correct_count, wrong_count, box, due_at
+            FROM words
+            ORDER BY wrong_count DESC, box ASC, due_at ASC
+            LIMIT 10
+            """
+        ).fetchall()
+    return {
+        "words": totals["words"],
+        "correct": totals["correct"] or 0,
+        "wrong": totals["wrong"] or 0,
+        "avg_box": round(float(totals["avg_box"] or 0), 2),
+        "weekly": weekly_progress(),
+        "schedule": schedule_status(),
+        "settings": {
+            "days": ENV.get("QUIZ_DAYS", "mon,tue,wed,thu,fri,sat,sun"),
+            "window": f"{ENV.get('QUIZ_WINDOW_START', '07:30')}-{ENV.get('QUIZ_WINDOW_END', '20:30')}",
+            "block_windows": ENV.get("QUIZ_BLOCK_WINDOWS", ""),
+            "min_gap_minutes": int(ENV.get("QUIZ_MIN_GAP_MINUTES", "45")),
+            "max_gap_minutes": int(ENV.get("QUIZ_MAX_GAP_MINUTES", "180")),
+            "weekly_goal_min_answers": int(ENV.get("WEEKLY_GOAL_MIN_ANSWERS", "10")),
+            "rewards": [{"threshold": threshold, "reward": reward} for threshold, reward in reward_tiers()],
+        },
+        "hardest": [dict(row) for row in hardest],
+    }
+
+
+class Handler(BaseHTTPRequestHandler):
+    def read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length", "0"))
+        return self.rfile.read(length) if length else b""
+
+    def send(self, status: int, body: bytes, content_type: str = "application/json") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            self.send(200, json.dumps({"ok": True, "time": dt(now())}).encode())
+        elif self.path == "/admin/stats":
+            self.send(200, json.dumps(stats(), ensure_ascii=False, indent=2).encode())
+        else:
+            self.send(404, json.dumps({"error": "not found"}).encode())
+
+    def do_POST(self) -> None:
+        if self.path == "/admin/send-now":
+            prompt = send_quiz_now()
+            self.send(200, json.dumps({"sent": True, "prompt": dict(prompt)}, ensure_ascii=False).encode())
+            return
+        if self.path == "/twilio/inbound":
+            data = parse_qs(self.read_body().decode("utf-8"))
+            text = data.get("Body", [""])[0]
+            from_ = data.get("From", [""])[0]
+            log_event("inbound", {"from": from_, "body": text})
+            reply = handle_answer(text)
+            self.send(200, twiml(reply), "application/xml")
+            return
+        self.send(404, json.dumps({"error": "not found"}).encode())
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print(f"{self.address_string()} - {fmt % args}")
+
+
+def in_quiz_window() -> bool:
+    return bool(schedule_status()["allowed"])
+
+
+def scheduler_loop() -> None:
+    next_send = now() + timedelta(minutes=2)
+    while True:
+        try:
+            mark_expired()
+            enabled = ENV.get("QUIZ_ENABLED", "true").lower() == "true"
+            if enabled and in_quiz_window() and now() >= next_send and not active_prompt():
+                send_quiz_now()
+                low = int(ENV.get("QUIZ_MIN_GAP_MINUTES", "45"))
+                high = int(ENV.get("QUIZ_MAX_GAP_MINUTES", "180"))
+                next_send = now() + timedelta(minutes=random.randint(low, high))
+                log_event("next_send_scheduled", {"next_send": dt(next_send)})
+        except Exception as exc:
+            log_event("scheduler_error", {"error": repr(exc)})
+        time.sleep(30)
+
+
+def main() -> None:
+    init_db()
+    host = ENV.get("HOST", "127.0.0.1")
+    port = int(ENV.get("PORT", "8080"))
+    threading.Thread(target=scheduler_loop, daemon=True).start()
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"Greek WhatsApp quiz backend running on http://{host}:{port}")
+    print(f"Database: {DB_PATH}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
