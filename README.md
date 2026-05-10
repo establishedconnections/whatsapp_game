@@ -208,6 +208,16 @@ Er zijn twee modi:
 - `/toets`: echte toetsmodus. Antwoorden tellen mee voor score, beloningen en herhalingsschema.
 - `/uitleg`: oefenmodus op recente fouten uit de toets. Antwoorden tellen niet mee; de bot begint speels met multiple choice en legt daarna het woord extra uit met hint en vormen.
 
+Je kunt een toetsronde starten met een vast aantal woorden:
+
+```text
+/toets 10
+/toets struikel
+/toets struikel 8
+```
+
+`/toets struikel` gebruikt woorden die eerder fout gingen. Zonder getal gebruikt hij `TOETS_DEFAULT_COUNT`, standaard 10.
+
 `quiz` blijft als oude alias voor `/toets` werken. Als hij `ja`, `meer`, `volgende` of `nog een` stuurt, krijgt hij meteen een nieuw woord in dezelfde modus als net gebruikt.
 
 Als hij `nee`, `stop`, `klaar` of `later` stuurt, stopt de speelsessie rustig.

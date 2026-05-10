@@ -463,7 +463,22 @@ def init_db() -> None:
                 score REAL,
                 mode TEXT NOT NULL DEFAULT 'toets',
                 choices_json TEXT,
+                session_id INTEGER,
                 FOREIGN KEY(word_id) REFERENCES words(id)
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quiz_sessions (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'toets',
+                source TEXT NOT NULL DEFAULT 'normal',
+                target_count INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id)
             )
             """
         )
@@ -498,6 +513,8 @@ def init_db() -> None:
             con.execute("ALTER TABLE prompts ADD COLUMN mode TEXT NOT NULL DEFAULT 'toets'")
         if "choices_json" not in prompt_columns:
             con.execute("ALTER TABLE prompts ADD COLUMN choices_json TEXT")
+        if "session_id" not in prompt_columns:
+            con.execute("ALTER TABLE prompts ADD COLUMN session_id INTEGER")
         user_columns = {row[1] for row in con.execute("PRAGMA table_info(users)")}
         if "last_mode" not in user_columns:
             con.execute("ALTER TABLE users ADD COLUMN last_mode TEXT NOT NULL DEFAULT 'toets'")
@@ -652,6 +669,96 @@ def review_word_count(user_id: int) -> int:
     return int(row["count"] or 0)
 
 
+def active_session(user_id: int) -> sqlite3.Row | None:
+    with db() as con:
+        return con.execute(
+            """
+            SELECT * FROM quiz_sessions
+            WHERE user_id = ? AND ended_at IS NULL
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+
+
+def start_session(user_id: int, target_count: int, source: str = "normal") -> sqlite3.Row:
+    target_count = max(1, min(50, target_count))
+    source = "struikel" if source == "struikel" else "normal"
+    with db() as con:
+        con.execute(
+            "UPDATE quiz_sessions SET ended_at = ? WHERE user_id = ? AND ended_at IS NULL",
+            (dt(now()), user_id),
+        )
+        cur = con.execute(
+            """
+            INSERT INTO quiz_sessions(user_id, mode, source, target_count, started_at)
+            VALUES (?, 'toets', ?, ?, ?)
+            """,
+            (user_id, source, target_count, dt(now())),
+        )
+        return con.execute("SELECT * FROM quiz_sessions WHERE id = ?", (cur.lastrowid,)).fetchone()
+
+
+def end_session(session_id: int) -> None:
+    with db() as con:
+        con.execute("UPDATE quiz_sessions SET ended_at = ? WHERE id = ?", (dt(now()), session_id))
+
+
+def session_progress(session_id: int) -> dict[str, Any]:
+    with db() as con:
+        session = con.execute("SELECT * FROM quiz_sessions WHERE id = ?", (session_id,)).fetchone()
+        row = con.execute(
+            """
+            SELECT
+              COUNT(*) AS answered,
+              SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) AS correct,
+              SUM(COALESCE(score, CASE WHEN correct = 1 THEN 1.0 ELSE 0.0 END)) AS points
+            FROM prompts
+            WHERE session_id = ?
+              AND answered_at IS NOT NULL
+              AND correct IS NOT NULL
+            """,
+            (session_id,),
+        ).fetchone()
+    answered = int(row["answered"] or 0)
+    correct = int(row["correct"] or 0)
+    points = float(row["points"] or 0)
+    target = int(session["target_count"] or answered) if session else answered
+    return {"answered": answered, "correct": correct, "points": points, "target": target, "source": session["source"] if session else "normal"}
+
+
+def format_session_progress(progress: dict[str, Any]) -> str:
+    points = f"{progress['points']:.1f}".rstrip("0").rstrip(".")
+    return f"Toetsronde: {progress['answered']}/{progress['target']} klaar, {points} punten."
+
+
+def format_session_finished(progress: dict[str, Any]) -> str:
+    points = f"{progress['points']:.1f}".rstrip("0").rstrip(".")
+    pct = round((progress["points"] / progress["answered"]) * 100) if progress["answered"] else 0
+    label = "struikeltoets" if progress["source"] == "struikel" else "toets"
+    return f"Klaar met de {label}: {points}/{progress['answered']} punten ({pct}%)."
+
+
+def session_word_ids(session_id: int | None) -> set[int]:
+    if not session_id:
+        return set()
+    with db() as con:
+        rows = con.execute("SELECT word_id FROM prompts WHERE session_id = ?", (session_id,)).fetchall()
+    return {int(row["word_id"]) for row in rows}
+
+
+def choose_word_for_source(user_id: int, source: str = "normal", session_id: int | None = None) -> sqlite3.Row:
+    seen = session_word_ids(session_id)
+    chooser = choose_review_word if source == "struikel" else choose_word
+    chosen = chooser(user_id)
+    for _ in range(20):
+        if chosen["id"] not in seen:
+            return chosen
+        chosen = chooser(user_id)
+    return chosen
+
+
 def active_prompt(user_id: int) -> sqlite3.Row | None:
     with db() as con:
         return con.execute(
@@ -688,15 +795,15 @@ def create_choices(con: sqlite3.Connection, word_id: int) -> list[dict[str, Any]
     return options
 
 
-def create_prompt(user_id: int, word_id: int, mode: str = "toets") -> sqlite3.Row:
+def create_prompt(user_id: int, word_id: int, mode: str = "toets", session_id: int | None = None) -> sqlite3.Row:
     timeout = int(ENV.get("ANSWER_TIMEOUT_MINUTES", "5"))
     sent = now()
     expires = sent + timedelta(minutes=timeout)
     with db() as con:
         choices_json = json.dumps(create_choices(con, word_id), ensure_ascii=False) if mode == "uitleg" else None
         cur = con.execute(
-            "INSERT INTO prompts(user_id, word_id, sent_at, expires_at, mode, choices_json) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, word_id, dt(sent), dt(expires), mode, choices_json),
+            "INSERT INTO prompts(user_id, word_id, sent_at, expires_at, mode, choices_json, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, word_id, dt(sent), dt(expires), mode, choices_json, session_id),
         )
         prompt_id = cur.lastrowid
         return con.execute(
@@ -980,12 +1087,15 @@ def send_quiz_now(user_id: int, to: str | None = None, mode: str = "toets") -> s
     return prompt
 
 
-def new_quiz_text(user_id: int, mode: str = "toets") -> str:
+def new_quiz_text(user_id: int, mode: str = "toets", session_id: int | None = None, source: str = "normal") -> str:
     review_count = review_word_count(user_id) if mode == "uitleg" else 0
-    word = choose_review_word(user_id) if mode == "uitleg" else choose_word(user_id)
-    prompt = create_prompt(user_id, word["id"], mode)
+    if mode == "uitleg":
+        word = choose_review_word(user_id)
+    else:
+        word = choose_word_for_source(user_id, source, session_id)
+    prompt = create_prompt(user_id, word["id"], mode, session_id=session_id)
     set_user_mode(user_id, mode)
-    log_event("prompt_created", {"prompt_id": prompt["id"], "user_id": user_id, "word_id": prompt["word_id"], "greek": prompt["greek"], "mode": mode})
+    log_event("prompt_created", {"prompt_id": prompt["id"], "user_id": user_id, "word_id": prompt["word_id"], "greek": prompt["greek"], "mode": mode, "session_id": session_id, "source": source})
     if mode == "uitleg" and review_count == 0:
         return "Je hebt nog geen foute toetswoorden om uit te leggen. We oefenen daarom een gewoon woord, zonder score.\n" + quiz_text(prompt)
     return quiz_text(prompt)
@@ -1159,6 +1269,21 @@ def ask_more_text_for_mode(mode: str) -> str:
     return ask_more_text()
 
 
+def parse_toets_request(cleaned: str) -> dict[str, Any] | None:
+    parts = cleaned.split()
+    if not parts or parts[0] not in {"toets", "quiz", "vraag", "start"}:
+        return None
+    source = "struikel" if any(part in {"struikel", "struikelwoorden", "fouten", "moeilijk"} for part in parts[1:]) else "normal"
+    count = None
+    for part in parts[1:]:
+        if part.isdigit():
+            count = int(part)
+            break
+    if count is None:
+        count = int(ENV.get("TOETS_DEFAULT_COUNT", "10")) if source == "struikel" else None
+    return {"count": count, "source": source, "explicit": bool(parts[1:])}
+
+
 def configured_lines(key: str, fallback: list[str]) -> list[str]:
     raw = ENV.get(key, "")
     if not raw.strip():
@@ -1206,16 +1331,24 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
 
     prompt = active_prompt(user["id"])
 
-    if cleaned in {"start", "quiz", "vraag", "toets"}:
+    toets_request = parse_toets_request(cleaned)
+    if toets_request:
         if (
             prompt
             and row_value(prompt, "mode", "toets") == "toets"
             and parse_dt(prompt["expires_at"])
             and parse_dt(prompt["expires_at"]) > now()
+            and not toets_request["explicit"]
         ):
             return quiz_text(prompt)
         if prompt:
             mark_expired(user["id"])
+        if toets_request["count"]:
+            session = start_session(user["id"], toets_request["count"], toets_request["source"])
+            label = "struikeltoets" if session["source"] == "struikel" else "toets"
+            return f"We starten een {label} van {session['target_count']} woorden.\n" + new_quiz_text(
+                user["id"], "toets", session_id=session["id"], source=session["source"]
+            )
         return new_quiz_text(user["id"], "toets")
 
     if cleaned in {"uitleg", "oefen", "oefenen"}:
@@ -1299,6 +1432,24 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
         return f"{verdict}{ai_note}\nDit telt niet mee voor je score.\n{prompt['greek']} = {prompt['meaning']}.\n{explanation(prompt)}\n{ai_hint(prompt)}\n{ask_more_text_for_mode(mode)}"
 
     update_word_after_answer(prompt, text, correct)
+    session_id = row_value(prompt, "session_id")
+    if session_id:
+        progress = session_progress(int(session_id))
+        if progress["answered"] >= progress["target"]:
+            end_session(int(session_id))
+            result_line = f"Goed, {user['name']}! ✅" if correct else f"Bijna, maar niet goed. {miss_micro_text()}"
+            return (
+                f"{result_line}\n{prompt['greek']} = {prompt['meaning']}.\n"
+                f"{format_session_finished(progress)}\n"
+                f"{weekly_progress_text(user['id'])}\n"
+                "Stuur '/uitleg' om de fouten na te bespreken, of '/toets 10' voor een nieuwe ronde."
+            )
+        next_text = new_quiz_text(user["id"], "toets", session_id=int(session_id), source=progress["source"])
+        result_line = f"Goed, {user['name']}! ✅" if correct else f"Bijna, maar niet goed. {miss_micro_text()}"
+        return (
+            f"{result_line}\n{prompt['greek']} = {prompt['meaning']}.\n"
+            f"{format_session_progress(progress)}\n\n{next_text}"
+        )
     if correct:
         ai_note = ""
         if ai_result and ai_result.get("reason_dutch"):
