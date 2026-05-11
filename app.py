@@ -1714,15 +1714,25 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
     prompt = active_prompt(user["id"])
 
     if cleaned in {"start", "help", "hulp"} or text.strip() in {"/start", "/help"}:
+        if bool(row_value(user, "pending_reset", 0)):
+            set_pending_reset(user["id"], False)
         return help_text(name=user["name"])
 
     if bool(row_value(user, "pending_reset", 0)):
-        if is_yes(text) or cleaned in {"reset bevestig", "reset nu"}:
+        if cleaned in {"leer", "uitleg", "oefen", "oefenen"} or parse_toets_request(cleaned):
+            set_pending_reset(user["id"], False)
+            user = get_or_create_user(user["platform"], user["external_id"])
+        elif is_yes(text) or cleaned in {"reset bevestig", "reset nu"}:
             reset_user(user["id"])
             return "Reset klaar. Je naam en statistiek zijn gewist.\n\n" + help_text(registered=False)
-        if is_no(text):
+        elif is_no(text):
             set_pending_reset(user["id"], False)
             return "Reset geannuleerd. Je gegevens blijven bewaard."
+        elif prompt:
+            set_pending_reset(user["id"], False)
+            user = get_or_create_user(user["platform"], user["external_id"])
+        else:
+            return "Reset staat klaar. Stuur 'ja' om te bevestigen of 'nee' om te annuleren."
 
     if cleaned == "reset":
         set_pending_reset(user["id"], True)
