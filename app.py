@@ -998,6 +998,26 @@ def create_meaning_choices(con: sqlite3.Connection, word_id: int) -> list[dict[s
     return create_choices(con, word_id)
 
 
+def create_form_choices(con: sqlite3.Connection, word_id: int, field: str) -> list[dict[str, Any]]:
+    correct = con.execute(f"SELECT id, {field} FROM words WHERE id = ?", (word_id,)).fetchone()
+    distractors = con.execute(
+        f"""
+        SELECT id, {field}
+        FROM words
+        WHERE id <> ? AND {field} IS NOT NULL AND {field} <> ''
+        ORDER BY RANDOM()
+        LIMIT 3
+        """,
+        (word_id,),
+    ).fetchall()
+    options = [{"word_id": correct["id"], "text": correct[field], "correct": True}]
+    options.extend({"word_id": row["id"], "text": row[field], "correct": False} for row in distractors)
+    random.shuffle(options)
+    for label, option in zip(["A", "B", "C", "D"], options):
+        option["label"] = label
+    return options
+
+
 def create_learning_exercise(con: sqlite3.Connection, word_id: int) -> dict[str, Any]:
     word = con.execute("SELECT * FROM words WHERE id = ?", (word_id,)).fetchone()
     available = ["meaning_choice"]
@@ -1017,6 +1037,7 @@ def create_learning_exercise(con: sqlite3.Connection, word_id: int) -> dict[str,
             "type": kind,
             "question": f"Wat is het imperfectum van {word['greek']}?",
             "expected": word["imperfectum"],
+            "choices": create_form_choices(con, word_id, "imperfectum"),
             "answer_label": "imperfectum",
         }
     if kind == "aoristus_text":
@@ -1024,6 +1045,7 @@ def create_learning_exercise(con: sqlite3.Connection, word_id: int) -> dict[str,
             "type": kind,
             "question": f"Wat is de aoristus van {word['greek']}?",
             "expected": word["aoristus"],
+            "choices": create_form_choices(con, word_id, "aoristus"),
             "answer_label": "aoristus",
         }
     form_name = "imperfectum" if kind == "imperfectum_meaning_choice" else "aoristus"
@@ -1067,7 +1089,7 @@ def quiz_text(prompt: sqlite3.Row) -> str:
         choices = prompt_choices(prompt)
         question = exercise.get("question") or f"Wat betekent {prompt['greek']}?"
         if choices:
-            options = "\n".join(f"{choice['label']}. {choice['meaning']}" for choice in choices)
+            options = "\n".join(f"{choice['label']}. {choice.get('meaning') or choice.get('text')}" for choice in choices)
             return f"📚 LEERWOORD\n{prompt['greek']}\n\n{question}\nDit telt niet mee voor je score.\n{options}"
         return f"📚 LEERWOORD\n{prompt['greek']}\n\n{question}\nDit telt niet mee voor je score."
     return f"🎯 TOETSWOORD\n{prompt['greek']}\n\nWat is de Nederlandse vertaling? Je hebt {mins} minuten."
@@ -1109,7 +1131,8 @@ def evaluate_learning_answer(prompt: sqlite3.Row, answer: str) -> tuple[bool, st
     kind = exercise.get("type", "meaning_choice")
     choice = selected_choice(prompt, answer)
     if choice:
-        return bool(choice.get("correct")), f"Jouw keuze: {choice['label']}. {choice['meaning']}"
+        value = choice.get("meaning") or choice.get("text")
+        return bool(choice.get("correct")), f"Jouw keuze: {choice['label']}. {value}"
     if kind in {"imperfectum_text", "aoristus_text"}:
         expected = exercise.get("expected", "")
         return greek_matches(answer, expected), f"Jouw antwoord: {answer.strip()}\nGoed antwoord: {expected}"
