@@ -43,10 +43,11 @@ Hoi! Ik ben je Griekse woordjesbot.
 
 Zo werkt het:
 /toets 10 - start een toetsronde van 10 woorden
-/toets struikel - toets woorden die eerder fout gingen
-/leer - oefen foute woorden met meerkeuze en uitleg
+/toets struikel - toets eerdere fouten voor extra score
+/leer - oefen met meerkeuze en uitleg; verdien oefenmunten
 /hint - krijg hulp bij een open vraag
-status - bekijk je game-score
+/beloning - spreek een weekdoel en beloning af
+/status - bekijk score, munten en beloning
 
 Hoe heet je? Stuur je naam, dan maak ik je profiel aan.
 ```
@@ -215,7 +216,18 @@ Wil je er nog een? Antwoord met ja of nee.
 Er zijn twee modi:
 
 - `/toets`: echte toetsmodus. Antwoorden tellen mee voor score, beloningen en herhalingsschema.
-- `/leer`: oefenmodus op recente fouten uit de toets. Antwoorden tellen niet mee; de bot begint speels met multiple choice, vormvragen of betekenisvragen en legt daarna het woord extra uit.
+- `/toets struikel`: toetsmodus met woorden die eerder fout gingen. Goede antwoorden leveren extra score op.
+- `/leer`: oefenmodus op recente fouten uit de toets. Antwoorden geven oefenmunten, maar kunnen je toets-score niet verlagen. De bot begint speels met multiple choice, vormvragen of betekenisvragen en legt daarna het woord extra uit.
+
+Oefenmunten zijn een aparte bucket naast de toets-score. Ze zijn bedoeld om inzet te belonen en kunnen later bijvoorbeeld worden ingewisseld voor verzamelplaten.
+
+Met `/beloning` kun je een thuis afgesproken weekdoel vastleggen:
+
+```text
+/beloning 80 7 ijsje
+```
+
+Dit betekent: probeer binnen 7 dagen 80% game-score te halen. Elke dag telt pas mee als er minstens 5 antwoorden zijn gegeven, zodat een doel niet met één losse vraag per dag gehaald kan worden.
 
 Je kunt een toetsronde starten met een vast aantal woorden:
 
@@ -231,7 +243,7 @@ Je kunt een toetsronde starten met een vast aantal woorden:
 
 Als hij `nee`, `stop`, `klaar` of `later` stuurt, stopt de speelsessie rustig.
 
-Met `status`, `score` of `beloning` krijgt hij de game-score te zien.
+Met `/status` of `score` krijgt hij de game-score, oefenmunten en beloning te zien. Met `/beloning` kan hij het weekdoel bekijken of instellen.
 
 Met `/hint`, `hint`, `tip` of `hulp` krijgt hij een hulpje richting het antwoord, zonder dat het antwoord letterlijk verklapt wordt. In `/toets` levert een goed antwoord na een hint minder game-score op:
 

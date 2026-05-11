@@ -516,12 +516,17 @@ def init_db() -> None:
                 awaiting_name INTEGER NOT NULL DEFAULT 1,
                 last_mode TEXT NOT NULL DEFAULT 'toets',
                 game_score REAL NOT NULL DEFAULT 0,
+                learn_coins REAL NOT NULL DEFAULT 0,
                 correct_streak INTEGER NOT NULL DEFAULT 0,
                 wrong_streak INTEGER NOT NULL DEFAULT 0,
                 last_play_date TEXT,
                 last_decay_date TEXT,
                 last_reminder_at TEXT,
                 pending_reset INTEGER NOT NULL DEFAULT 0,
+                reward_goal_score REAL NOT NULL DEFAULT 80,
+                reward_goal_days INTEGER NOT NULL DEFAULT 7,
+                reward_text TEXT,
+                reward_started_at TEXT,
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 UNIQUE(platform, external_id)
@@ -616,6 +621,8 @@ def init_db() -> None:
             con.execute("ALTER TABLE users ADD COLUMN last_mode TEXT NOT NULL DEFAULT 'toets'")
         if "game_score" not in user_columns:
             con.execute("ALTER TABLE users ADD COLUMN game_score REAL NOT NULL DEFAULT 0")
+        if "learn_coins" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN learn_coins REAL NOT NULL DEFAULT 0")
         if "correct_streak" not in user_columns:
             con.execute("ALTER TABLE users ADD COLUMN correct_streak INTEGER NOT NULL DEFAULT 0")
         if "wrong_streak" not in user_columns:
@@ -628,6 +635,14 @@ def init_db() -> None:
             con.execute("ALTER TABLE users ADD COLUMN last_reminder_at TEXT")
         if "pending_reset" not in user_columns:
             con.execute("ALTER TABLE users ADD COLUMN pending_reset INTEGER NOT NULL DEFAULT 0")
+        if "reward_goal_score" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN reward_goal_score REAL NOT NULL DEFAULT 80")
+        if "reward_goal_days" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN reward_goal_days INTEGER NOT NULL DEFAULT 7")
+        if "reward_text" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN reward_text TEXT")
+        if "reward_started_at" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN reward_started_at TEXT")
         word_columns = {row[1] for row in con.execute("PRAGMA table_info(words)")}
         if "hint_text" not in word_columns:
             con.execute("ALTER TABLE words ADD COLUMN hint_text TEXT")
@@ -716,11 +731,13 @@ def today_key(at: datetime | None = None) -> str:
     return (at or now()).date().isoformat()
 
 
-def game_score_delta(correct: bool, used_hint: bool, correct_streak: int, wrong_streak: int) -> float:
+def game_score_delta(correct: bool, used_hint: bool, correct_streak: int, wrong_streak: int, source: str = "normal") -> float:
     if correct:
         base = float(ENV.get("GAME_CORRECT_POINTS", "2"))
         if used_hint:
             base *= float(ENV.get("GAME_HINT_MULTIPLIER", "0.5"))
+        if source == "struikel":
+            base *= float(ENV.get("GAME_STRUIKEL_MULTIPLIER", "1.5"))
         if correct_streak and correct_streak % 10 == 0:
             base += float(ENV.get("GAME_STREAK_10_BONUS", "5"))
         elif correct_streak and correct_streak % 5 == 0:
@@ -733,7 +750,7 @@ def game_score_delta(correct: bool, used_hint: bool, correct_streak: int, wrong_
     return -float(ENV.get("GAME_WRONG_STREAK_PENALTY", "2")) * wrong_streak
 
 
-def apply_game_result(user_id: int, correct: bool, used_hint: bool = False) -> dict[str, Any]:
+def apply_game_result(user_id: int, correct: bool, used_hint: bool = False, source: str = "normal") -> dict[str, Any]:
     with db() as con:
         user = con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         old_score = float(user["game_score"] or 0)
@@ -745,7 +762,7 @@ def apply_game_result(user_id: int, correct: bool, used_hint: bool = False) -> d
         else:
             wrong_streak += 1
             correct_streak = 0
-        delta = game_score_delta(correct, used_hint, correct_streak, wrong_streak)
+        delta = game_score_delta(correct, used_hint, correct_streak, wrong_streak, source)
         new_score = clamp_score(old_score + delta)
         con.execute(
             """
@@ -763,6 +780,33 @@ def apply_game_result(user_id: int, correct: bool, used_hint: bool = False) -> d
         "correct_streak": correct_streak,
         "wrong_streak": wrong_streak,
     }
+
+
+def learn_coin_delta(correct: bool) -> float:
+    base = float(ENV.get("LEARN_COINS_BASE", "1"))
+    bonus = float(ENV.get("LEARN_COINS_CORRECT_BONUS", "2")) if correct else 0.0
+    return max(0.0, base + bonus)
+
+
+def apply_learn_result(user_id: int, correct: bool) -> dict[str, Any]:
+    delta = learn_coin_delta(correct)
+    with db() as con:
+        user = con.execute("SELECT learn_coins FROM users WHERE id = ?", (user_id,)).fetchone()
+        old_coins = float(user["learn_coins"] or 0)
+        new_coins = old_coins + delta
+        con.execute(
+            "UPDATE users SET learn_coins = ?, last_seen_at = ? WHERE id = ?",
+            (new_coins, dt(now()), user_id),
+        )
+    return {"old_coins": old_coins, "new_coins": new_coins, "delta": delta}
+
+
+def coin_count(value: float) -> str:
+    return f"{value:.1f}".rstrip("0").rstrip(".")
+
+
+def learn_coin_text(change: dict[str, Any]) -> str:
+    return f"Oefenmunten: +{coin_count(change['delta'])} 🪙 (totaal {coin_count(change['new_coins'])})."
 
 
 def score_delta_text(change: dict[str, Any]) -> str:
@@ -821,7 +865,9 @@ def game_status(user_id: int) -> dict[str, Any]:
 
 def game_status_text(user_id: int) -> str:
     status = game_status(user_id)
-    line = f"Game-score: {status['score']:.1f}%."
+    with db() as con:
+        user = con.execute("SELECT learn_coins FROM users WHERE id = ?", (user_id,)).fetchone()
+    line = f"Game-score: {status['score']:.1f}%. Oefenmunten: {coin_count(float(user['learn_coins'] or 0))} 🪙."
     if status["correct_streak"]:
         line += f" Reeks: {status['correct_streak']} goed."
     if status["wrong_streak"] >= 2:
@@ -849,9 +895,10 @@ def reset_user(user_id: int) -> sqlite3.Row:
             """
             UPDATE users
             SET name = NULL, awaiting_name = 1, last_mode = 'toets',
-                game_score = 0, correct_streak = 0, wrong_streak = 0,
+                game_score = 0, learn_coins = 0, correct_streak = 0, wrong_streak = 0,
                 last_play_date = NULL, last_decay_date = NULL, last_reminder_at = NULL,
-                pending_reset = 0,
+                pending_reset = 0, reward_goal_score = 80, reward_goal_days = 7,
+                reward_text = NULL, reward_started_at = NULL,
                 last_seen_at = ?
             WHERE id = ?
             """,
@@ -1000,6 +1047,15 @@ def session_progress(session_id: int) -> dict[str, Any]:
     points = float(row["points"] or 0)
     target = int(session["target_count"] or answered) if session else answered
     return {"answered": answered, "correct": correct, "points": points, "target": target, "source": session["source"] if session else "normal"}
+
+
+def prompt_session_source(prompt: sqlite3.Row) -> str:
+    session_id = row_value(prompt, "session_id")
+    if not session_id:
+        return "normal"
+    with db() as con:
+        row = con.execute("SELECT source FROM quiz_sessions WHERE id = ?", (int(session_id),)).fetchone()
+    return row["source"] if row and row["source"] == "struikel" else "normal"
 
 
 def format_session_progress(progress: dict[str, Any]) -> str:
@@ -1167,8 +1223,8 @@ def quiz_text(prompt: sqlite3.Row) -> str:
         question = exercise.get("question") or f"Wat betekent {prompt['greek']}?"
         if choices:
             options = "\n".join(f"{choice['label']}. {choice.get('meaning') or choice.get('text')}" for choice in choices)
-            return f"📚 LEERWOORD\n{prompt['greek']}\n\n{question}\nDit telt niet mee voor je score.\n{options}"
-        return f"📚 LEERWOORD\n{prompt['greek']}\n\n{question}\nDit telt niet mee voor je score."
+            return f"📚 LEERWOORD\n{prompt['greek']}\n\n{question}\nJe verdient oefenmunten; geen negatieve toets-score.\n{options}"
+        return f"📚 LEERWOORD\n{prompt['greek']}\n\n{question}\nJe verdient oefenmunten; geen negatieve toets-score."
     return f"🎯 TOETSWOORD\n{prompt['greek']}\n\nWat is de Nederlandse vertaling? Je hebt {mins} minuten."
 
 
@@ -1464,7 +1520,7 @@ def new_quiz_text(user_id: int, mode: str = "toets", session_id: int | None = No
     set_user_mode(user_id, mode)
     log_event("prompt_created", {"prompt_id": prompt["id"], "user_id": user_id, "word_id": prompt["word_id"], "greek": prompt["greek"], "mode": mode, "session_id": session_id, "source": source})
     if mode == "uitleg" and review_count == 0:
-        return "Je hebt nog geen foute toetswoorden om te leren. We oefenen daarom een gewoon woord, zonder score.\n" + quiz_text(prompt)
+        return "Je hebt nog geen foute toetswoorden om te leren. We oefenen daarom een gewoon woord voor oefenmunten.\n" + quiz_text(prompt)
     return quiz_text(prompt)
 
 
@@ -1609,7 +1665,109 @@ def weekly_progress(user_id: int) -> dict[str, Any]:
 
 
 def weekly_progress_text(user_id: int) -> str:
-    return game_status_text(user_id)
+    return f"{game_status_text(user_id)}\n{reward_status_text(user_id, compact=True)}"
+
+
+def reward_defaults() -> dict[str, Any]:
+    return {
+        "score": float(ENV.get("REWARD_DEFAULT_SCORE", "80")),
+        "days": int(ENV.get("REWARD_DEFAULT_DAYS", "7")),
+        "daily_answers": int(ENV.get("REWARD_MIN_DAILY_ANSWERS", "5")),
+        "text": ENV.get("REWARD_DEFAULT_TEXT", "spreek thuis een beloning af"),
+    }
+
+
+def reward_activity(user_id: int, started_at: datetime, days: int) -> dict[str, Any]:
+    start_day = started_at.date()
+    end_day = start_day + timedelta(days=days)
+    minimum = reward_defaults()["daily_answers"]
+    with db() as con:
+        rows = con.execute(
+            """
+            SELECT substr(answered_at, 1, 10) AS day, COUNT(*) AS answered
+            FROM prompts
+            WHERE user_id = ?
+              AND answered_at IS NOT NULL
+              AND answered_at >= ?
+              AND answered_at < ?
+            GROUP BY substr(answered_at, 1, 10)
+            """,
+            (user_id, dt(started_at), dt(datetime.combine(end_day, datetime.min.time()))),
+        ).fetchall()
+    answered_by_day = {row["day"]: int(row["answered"] or 0) for row in rows}
+    active_days = sum(1 for answered in answered_by_day.values() if answered >= minimum)
+    today = now().date()
+    elapsed_days = 0 if today < start_day else min(days, (min(today, end_day - timedelta(days=1)) - start_day).days + 1)
+    total_answers = sum(answered_by_day.values())
+    return {
+        "active_days": active_days,
+        "elapsed_days": elapsed_days,
+        "total_answers": total_answers,
+        "minimum": minimum,
+        "end_day": end_day - timedelta(days=1),
+    }
+
+
+def reward_status_text(user_id: int, compact: bool = False) -> str:
+    status = game_status(user_id)
+    defaults = reward_defaults()
+    with db() as con:
+        user = con.execute(
+            "SELECT reward_goal_score, reward_goal_days, reward_text, reward_started_at FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+    if not user["reward_started_at"]:
+        if compact:
+            return "Beloning: nog niet ingesteld. Gebruik '/beloning 80 7 ijsje'."
+        return (
+            "Beloning: nog niet ingesteld.\n"
+            "Voorbeeld: '/beloning 80 7 ijsje' betekent: haal 80% binnen 7 dagen, "
+            "met elke dag genoeg oefening."
+        )
+    target = float(user["reward_goal_score"] or defaults["score"])
+    days = int(user["reward_goal_days"] or defaults["days"])
+    reward = user["reward_text"] or defaults["text"]
+    started_at = parse_dt(user["reward_started_at"]) or now()
+    activity = reward_activity(user_id, started_at, days)
+    achieved = status["score"] >= target and activity["active_days"] >= days
+    header = f"Beloning: {reward} bij {target:g}% in {days} dagen."
+    work = (
+        f"Dagelijkse inzet: {activity['active_days']}/{days} dagen met "
+        f"minstens {activity['minimum']} antwoorden."
+    )
+    score = f"Nu: {status['score']:.1f}%."
+    if achieved:
+        return f"{header}\nGehaald ✅ {score} {work}"
+    return f"{header}\nNog bezig: {score} {work}"
+
+
+def handle_reward_command(user_id: int, text: str) -> str:
+    defaults = reward_defaults()
+    cleaned = normalize(text)
+    if cleaned in {"beloning", "reward"}:
+        return reward_status_text(user_id)
+    parts = cleaned.split()
+    numbers = [int(part) for part in parts if part.isdigit()]
+    target = max(1, min(100, numbers[0])) if numbers else int(defaults["score"])
+    days = max(1, min(30, numbers[1])) if len(numbers) > 1 else int(defaults["days"])
+    reward_words = [part for part in parts[1:] if not part.isdigit()]
+    reward = " ".join(reward_words).strip() or defaults["text"]
+    reward = reward[:80]
+    with db() as con:
+        con.execute(
+            """
+            UPDATE users
+            SET reward_goal_score = ?, reward_goal_days = ?, reward_text = ?,
+                reward_started_at = ?, last_seen_at = ?
+            WHERE id = ?
+            """,
+            (float(target), days, reward, dt(now()), dt(now()), user_id),
+        )
+    return (
+        f"Beloning ingesteld: {reward} bij {target}% binnen {days} dagen.\n"
+        f"Voor dit doel telt elke dag pas mee vanaf {defaults['daily_answers']} antwoorden.\n"
+        f"{reward_status_text(user_id)}"
+    )
 
 
 def legacy_weekly_progress_text(user_id: int) -> str:
@@ -1647,11 +1805,12 @@ def help_text(registered: bool = True, name: str | None = None) -> str:
         "",
         "Zo werkt het:",
         "/toets 10 - start een toetsronde van 10 woorden",
-        "/toets struikel - toets woorden die eerder fout gingen",
-        "/leer - oefen foute woorden met meerkeuze en uitleg",
+        "/toets struikel - toets eerdere fouten voor extra score",
+        "/leer - oefen met meerkeuze en uitleg; verdien oefenmunten",
         "/hint - krijg hulp bij een open vraag",
+        "/beloning - spreek een weekdoel en beloning af",
         "/reset - reset naam en statistiek voor deze gebruiker",
-        "status - bekijk je game-score",
+        "/status - bekijk score, munten en beloning",
         "",
     ]
     if registered:
@@ -1735,7 +1894,7 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
         return help_text(name=user["name"])
 
     if bool(row_value(user, "pending_reset", 0)):
-        if cleaned in {"leer", "uitleg", "oefen", "oefenen"} or parse_toets_request(cleaned):
+        if cleaned in {"leer", "uitleg", "oefen", "oefenen", "status", "score"} or cleaned.startswith("beloning") or parse_toets_request(cleaned):
             set_pending_reset(user["id"], False)
             user = get_or_create_user(user["platform"], user["external_id"])
         elif is_yes(text) or cleaned in {"reset bevestig", "reset nu"}:
@@ -1795,19 +1954,23 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
             return new_quiz_text(user["id"], mode)
         if is_no(text):
             return "Prima, later weer verder. Stuur '/toets' voor score of '/leer' om te oefenen."
-        if cleaned in {"status", "score", "beloning"}:
+        if cleaned.startswith("beloning") or cleaned.startswith("reward"):
+            return handle_reward_command(user["id"], text)
+        if cleaned in {"status", "score"}:
             return weekly_progress_text(user["id"])
         if cleaned in {"naam", "name"}:
             with db() as con:
                 con.execute("UPDATE users SET awaiting_name = 1 WHERE id = ?", (user["id"],))
             return "Hoe heet je?"
-        return "Er staat nu geen quizvraag open. Stuur '/toets' om je score te verhogen, '/leer' om te oefenen, of 'status' voor je game-score."
+        return "Er staat nu geen quizvraag open. Stuur '/toets' voor score, '/leer' voor oefenmunten, of '/status'."
 
     if is_yes(text):
         return quiz_text(prompt)
     if is_no(text):
         return "Prima, later weer verder. Je huidige quizvraag blijft nog even open; stuur de vertaling of later 'quiz' voor een nieuwe vraag."
-    if cleaned in {"status", "score", "beloning"}:
+    if cleaned.startswith("beloning") or cleaned.startswith("reward"):
+        return handle_reward_command(user["id"], text)
+    if cleaned in {"status", "score"}:
         return weekly_progress_text(user["id"])
     if cleaned in {"hint", "tip", "help", "hulp"}:
         already_used = bool(prompt["hint_used"]) if "hint_used" in prompt.keys() else False
@@ -1855,19 +2018,23 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
     set_user_mode(user["id"], mode)
     if mode == "uitleg":
         record_unscored_answer(prompt, text, correct)
+        coin_change = apply_learn_result(user["id"], correct)
         verdict = "Mooi, dat klopt." if correct else f"Nog niet helemaal. {miss_micro_text()}"
         return (
             f"{verdict}\n{learning_note}\n"
-            "Dit telt niet mee voor je score.\n\n"
+            f"{learn_coin_text(coin_change)}\n"
+            "Geen negatieve toets-score.\n\n"
             f"UITLEG\n{ai_lesson(prompt)}\n"
             f"{ask_more_text_for_mode(mode)}"
         )
 
     update_word_after_answer(prompt, text, correct)
+    source = prompt_session_source(prompt)
     game_change = apply_game_result(
         user["id"],
         correct,
         used_hint=bool(row_value(prompt, "hint_used", 0)),
+        source=source,
     )
     session_id = row_value(prompt, "session_id")
     if session_id:
