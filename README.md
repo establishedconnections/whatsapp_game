@@ -45,6 +45,9 @@ Zo werkt het:
 /toets 10 - start een toetsronde van 10 woorden
 /toets struikel - toets eerdere fouten voor extra score
 /leer - oefen met meerkeuze en uitleg; verdien oefenmunten
+/avatars - bekijk en koop Griekse goden
+/winkel - koop versiering voor je actieve avatar
+/mijnavatar - bekijk je actieve verzamelplaat
 /hint - krijg hulp bij een open vraag
 /beloning - spreek een weekdoel en beloning af
 /status - bekijk score, munten en beloning
@@ -219,7 +222,20 @@ Er zijn twee modi:
 - `/toets struikel`: toetsmodus met woorden die eerder fout gingen. Goede antwoorden leveren extra score op.
 - `/leer`: oefenmodus op recente fouten uit de toets. Antwoorden geven oefenmunten, maar kunnen je toets-score niet verlagen. De bot begint speels met multiple choice, vormvragen of betekenisvragen en legt daarna het woord extra uit.
 
-Oefenmunten zijn een aparte bucket naast de toets-score. Ze zijn bedoeld om inzet te belonen en kunnen later bijvoorbeeld worden ingewisseld voor verzamelplaten.
+Oefenmunten zijn een aparte bucket naast de toets-score. Ze zijn bedoeld om inzet te belonen en kunnen worden ingewisseld voor verzamelplaten.
+
+De eerste avatar is gratis. Standaard krijgt een nieuwe leerling Athena. Daarna kan hij met munten andere Griekse goden kopen, of de actieve avatar versieren met items.
+
+```text
+/avatars
+/kiesavatar athena
+/koop avatar zeus
+/winkel
+/koop zonnebril
+/mijnavatar
+```
+
+Items horen bij de actieve avatar. Zo kan Zeus een zonnebril hebben, terwijl Athena later haar eigen lauwerkrans of achtergrond krijgt.
 
 Met `/beloning` kun je een thuis afgesproken weekdoel vastleggen:
 

@@ -29,6 +29,32 @@ except ModuleNotFoundError:
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "quiz.sqlite3"
 
+AVATAR_CATALOG = [
+    ("athena", "Athena", "🦉", "wijsheid, helm en slimme plannen", 0),
+    ("zeus", "Zeus", "⚡", "bliksem, koning van de Olympus", 30),
+    ("poseidon", "Poseidon", "🔱", "zee, storm en drietand", 30),
+    ("hermes", "Hermes", "🪽", "snelheid, reizen en slimme streken", 25),
+    ("artemis", "Artemis", "🏹", "jacht, maan en scherpe focus", 25),
+    ("apollo", "Apollo", "☀️", "zon, muziek en helderheid", 25),
+    ("ares", "Ares", "🛡️", "strijd, lef en lawaai", 25),
+    ("hades", "Hades", "💀", "onderwereld en mysterieuze rijkdom", 35),
+    ("aphrodite", "Aphrodite", "🌹", "schoonheid en charme", 25),
+    ("dionysos", "Dionysos", "🍇", "feest, theater en druivenkracht", 25),
+]
+
+AVATAR_ITEMS = [
+    ("zonnebril", "Zonnebril", "😎", "accessoire", "instant cool-factor", 8),
+    ("lauwerkrans", "Lauwerkrans", "🏆", "hoofd", "overwinningsstijl", 10),
+    ("gouden_ketting", "Gouden ketting", "📿", "sieraad", "Olympus bling", 12),
+    ("cape", "Hero cape", "🦸", "kleding", "dramatische entree", 14),
+    ("sneakers", "Gouden sneakers", "👟", "kleding", "sneller naar het juiste antwoord", 14),
+    ("sterrenachtergrond", "Sterrenachtergrond", "🌌", "achtergrond", "nachtelijke epiek", 16),
+    ("tempelachtergrond", "Tempelachtergrond", "🏛️", "achtergrond", "klassieke kaart-look", 16),
+    ("bliksem_effect", "Bliksem-effect", "⚡", "effect", "extra Zeus-energie", 18),
+    ("uil_sidekick", "Uil-sidekick", "🦉", "sidekick", "kleine wijze coach", 18),
+    ("regenboog_aura", "Regenboog-aura", "🌈", "effect", "legendarische vibes", 22),
+]
+
 
 def load_env() -> dict[str, str]:
     env = dict(os.environ)
@@ -593,6 +619,58 @@ def init_db() -> None:
             )
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS avatar_catalog (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                description TEXT NOT NULL,
+                price INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS avatar_items (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                item_type TEXT NOT NULL,
+                description TEXT NOT NULL,
+                price INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_avatars (
+                user_id INTEGER NOT NULL,
+                avatar_id INTEGER NOT NULL,
+                unlocked_at TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, avatar_id),
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                FOREIGN KEY(avatar_id) REFERENCES avatar_catalog(id)
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_avatar_items (
+                user_id INTEGER NOT NULL,
+                avatar_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                purchased_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, avatar_id, item_id),
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                FOREIGN KEY(avatar_id) REFERENCES avatar_catalog(id),
+                FOREIGN KEY(item_id) REFERENCES avatar_items(id)
+            )
+            """
+        )
         due = dt(now())
         for greek, imperfectum, aoristus, meaning in ROWS:
             con.execute(
@@ -602,6 +680,33 @@ def init_db() -> None:
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (greek, imperfectum, aoristus, meaning, due),
+            )
+        for slug, name, symbol, description, price in AVATAR_CATALOG:
+            con.execute(
+                """
+                INSERT INTO avatar_catalog(slug, name, symbol, description, price)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                    name = excluded.name,
+                    symbol = excluded.symbol,
+                    description = excluded.description,
+                    price = excluded.price
+                """,
+                (slug, name, symbol, description, price),
+            )
+        for slug, name, symbol, item_type, description, price in AVATAR_ITEMS:
+            con.execute(
+                """
+                INSERT INTO avatar_items(slug, name, symbol, item_type, description, price)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                    name = excluded.name,
+                    symbol = excluded.symbol,
+                    item_type = excluded.item_type,
+                    description = excluded.description,
+                    price = excluded.price
+                """,
+                (slug, name, symbol, item_type, description, price),
             )
         prompt_columns = {row[1] for row in con.execute("PRAGMA table_info(prompts)")}
         if "user_id" not in prompt_columns:
@@ -715,6 +820,7 @@ def set_user_name(user_id: int, name: str) -> sqlite3.Row:
             (clean, dt(now()), user_id),
         )
         initialize_user_words(con, user_id)
+        ensure_avatar_profile(con, user_id)
         return con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
@@ -801,12 +907,257 @@ def apply_learn_result(user_id: int, correct: bool) -> dict[str, Any]:
     return {"old_coins": old_coins, "new_coins": new_coins, "delta": delta}
 
 
+def user_coin_balance(con: sqlite3.Connection, user_id: int) -> float:
+    row = con.execute("SELECT learn_coins FROM users WHERE id = ?", (user_id,)).fetchone()
+    return float(row["learn_coins"] or 0) if row else 0.0
+
+
 def coin_count(value: float) -> str:
     return f"{value:.1f}".rstrip("0").rstrip(".")
 
 
 def learn_coin_text(change: dict[str, Any]) -> str:
     return f"Oefenmunten: +{coin_count(change['delta'])} 🪙 (totaal {coin_count(change['new_coins'])})."
+
+
+def ensure_avatar_profile(con: sqlite3.Connection, user_id: int) -> sqlite3.Row:
+    active = con.execute(
+        """
+        SELECT avatar_catalog.*
+        FROM user_avatars
+        JOIN avatar_catalog ON avatar_catalog.id = user_avatars.avatar_id
+        WHERE user_avatars.user_id = ? AND user_avatars.is_active = 1
+        LIMIT 1
+        """,
+        (user_id,),
+    ).fetchone()
+    if active:
+        return active
+    starter_slug = ENV.get("STARTER_AVATAR", "athena")
+    starter = con.execute("SELECT * FROM avatar_catalog WHERE slug = ?", (starter_slug,)).fetchone()
+    if not starter:
+        starter = con.execute("SELECT * FROM avatar_catalog ORDER BY price ASC, id ASC LIMIT 1").fetchone()
+    con.execute(
+        "INSERT OR IGNORE INTO user_avatars(user_id, avatar_id, unlocked_at, is_active) VALUES (?, ?, ?, 1)",
+        (user_id, starter["id"], dt(now())),
+    )
+    con.execute(
+        "UPDATE user_avatars SET is_active = CASE WHEN avatar_id = ? THEN 1 ELSE 0 END WHERE user_id = ?",
+        (starter["id"], user_id),
+    )
+    return starter
+
+
+def active_avatar(con: sqlite3.Connection, user_id: int) -> sqlite3.Row:
+    return ensure_avatar_profile(con, user_id)
+
+
+def avatar_item_names(con: sqlite3.Connection, user_id: int, avatar_id: int) -> list[str]:
+    rows = con.execute(
+        """
+        SELECT avatar_items.symbol, avatar_items.name
+        FROM user_avatar_items
+        JOIN avatar_items ON avatar_items.id = user_avatar_items.item_id
+        WHERE user_avatar_items.user_id = ? AND user_avatar_items.avatar_id = ?
+        ORDER BY avatar_items.item_type, avatar_items.price, avatar_items.name
+        """,
+        (user_id, avatar_id),
+    ).fetchall()
+    return [f"{row['symbol']} {row['name']}" for row in rows]
+
+
+def avatar_status_text(user_id: int) -> str:
+    with db() as con:
+        avatar = active_avatar(con, user_id)
+        coins = user_coin_balance(con, user_id)
+        items = avatar_item_names(con, user_id, avatar["id"])
+    item_text = ", ".join(items) if items else "nog geen versiering"
+    return (
+        f"Mijn avatar: {avatar['symbol']} {avatar['name']}\n"
+        f"Stijl: {item_text}.\n"
+        f"Munten: {coin_count(coins)} 🪙."
+    )
+
+
+def avatar_collection_text(user_id: int) -> str:
+    with db() as con:
+        ensure_avatar_profile(con, user_id)
+        coins = user_coin_balance(con, user_id)
+        rows = con.execute(
+            """
+            SELECT avatar_catalog.*,
+                   CASE WHEN user_avatars.avatar_id IS NULL THEN 0 ELSE 1 END AS owned,
+                   COALESCE(user_avatars.is_active, 0) AS is_active
+            FROM avatar_catalog
+            LEFT JOIN user_avatars
+              ON user_avatars.avatar_id = avatar_catalog.id
+             AND user_avatars.user_id = ?
+            ORDER BY owned DESC, avatar_catalog.price ASC, avatar_catalog.name ASC
+            """,
+            (user_id,),
+        ).fetchall()
+    lines = [f"Avatarcollectie - {coin_count(coins)} 🪙", ""]
+    for row in rows:
+        marker = "actief" if row["is_active"] else "in bezit" if row["owned"] else f"{row['price']} 🪙"
+        lines.append(f"{row['symbol']} {row['name']} ({marker}) - {row['description']}")
+    lines.append("")
+    lines.append("Gebruik '/kiesavatar athena' of '/koop avatar zeus'.")
+    return "\n".join(lines)
+
+
+def avatar_shop_text(user_id: int) -> str:
+    with db() as con:
+        avatar = active_avatar(con, user_id)
+        coins = user_coin_balance(con, user_id)
+        rows = con.execute(
+            """
+            SELECT avatar_items.*,
+                   CASE WHEN user_avatar_items.item_id IS NULL THEN 0 ELSE 1 END AS owned
+            FROM avatar_items
+            LEFT JOIN user_avatar_items
+              ON user_avatar_items.item_id = avatar_items.id
+             AND user_avatar_items.avatar_id = ?
+             AND user_avatar_items.user_id = ?
+            ORDER BY owned ASC, avatar_items.price ASC, avatar_items.item_type, avatar_items.name
+            """,
+            (avatar["id"], user_id),
+        ).fetchall()
+    lines = [f"Winkel voor {avatar['symbol']} {avatar['name']} - {coin_count(coins)} 🪙", ""]
+    for row in rows:
+        marker = "gekocht" if row["owned"] else f"{row['price']} 🪙"
+        lines.append(f"{row['symbol']} {row['name']} ({marker}) - {row['description']}")
+    lines.append("")
+    lines.append("Gebruik '/koop zonnebril'. Nieuwe god? Gebruik '/koop avatar hermes'.")
+    return "\n".join(lines)
+
+
+def find_avatar(con: sqlite3.Connection, query: str) -> sqlite3.Row | None:
+    cleaned = normalize(query).replace(" ", "_")
+    rows = con.execute("SELECT * FROM avatar_catalog").fetchall()
+    for row in rows:
+        if cleaned in {normalize(row["slug"]).replace(" ", "_"), normalize(row["name"]).replace(" ", "_")}:
+            return row
+    return None
+
+
+def find_avatar_item(con: sqlite3.Connection, query: str) -> sqlite3.Row | None:
+    cleaned = normalize(query).replace(" ", "_")
+    rows = con.execute("SELECT * FROM avatar_items").fetchall()
+    for row in rows:
+        names = {normalize(row["slug"]).replace(" ", "_"), normalize(row["name"]).replace(" ", "_")}
+        if cleaned in names:
+            return row
+    for row in rows:
+        if cleaned and cleaned in normalize(row["name"]).replace(" ", "_"):
+            return row
+    return None
+
+
+def set_active_avatar(user_id: int, query: str) -> str:
+    with db() as con:
+        ensure_avatar_profile(con, user_id)
+        avatar = find_avatar(con, query)
+        if not avatar:
+            return "Die avatar ken ik nog niet. Kijk met '/avatars' welke goden er zijn."
+        owned = con.execute(
+            "SELECT 1 FROM user_avatars WHERE user_id = ? AND avatar_id = ?",
+            (user_id, avatar["id"]),
+        ).fetchone()
+        if not owned:
+            return f"{avatar['symbol']} {avatar['name']} is nog vergrendeld. Koop deze avatar met '/koop avatar {avatar['slug']}' voor {avatar['price']} 🪙."
+        con.execute("UPDATE user_avatars SET is_active = 0 WHERE user_id = ?", (user_id,))
+        con.execute("UPDATE user_avatars SET is_active = 1 WHERE user_id = ? AND avatar_id = ?", (user_id, avatar["id"]))
+    return f"Actieve avatar: {avatar['symbol']} {avatar['name']}."
+
+
+def buy_avatar(user_id: int, query: str) -> str:
+    with db() as con:
+        ensure_avatar_profile(con, user_id)
+        avatar = find_avatar(con, query)
+        if not avatar:
+            return "Die god ken ik nog niet. Kijk met '/avatars' welke avatars er zijn."
+        owned = con.execute(
+            "SELECT 1 FROM user_avatars WHERE user_id = ? AND avatar_id = ?",
+            (user_id, avatar["id"]),
+        ).fetchone()
+        if owned:
+            return f"{avatar['symbol']} {avatar['name']} heb je al. Kies hem met '/kiesavatar {avatar['slug']}'."
+        coins = user_coin_balance(con, user_id)
+        price = int(avatar["price"] or 0)
+        if coins < price:
+            return f"Nog niet genoeg munten voor {avatar['symbol']} {avatar['name']}. Nodig: {price} 🪙, jij hebt {coin_count(coins)} 🪙."
+        con.execute("UPDATE users SET learn_coins = learn_coins - ?, last_seen_at = ? WHERE id = ?", (price, dt(now()), user_id))
+        con.execute("UPDATE user_avatars SET is_active = 0 WHERE user_id = ?", (user_id,))
+        con.execute(
+            "INSERT INTO user_avatars(user_id, avatar_id, unlocked_at, is_active) VALUES (?, ?, ?, 1)",
+            (user_id, avatar["id"], dt(now())),
+        )
+        remaining = coins - price
+    return f"Vrijgespeeld: {avatar['symbol']} {avatar['name']}! Deze avatar is nu actief. Over: {coin_count(remaining)} 🪙."
+
+
+def buy_avatar_item(user_id: int, query: str) -> str:
+    with db() as con:
+        avatar = active_avatar(con, user_id)
+        item = find_avatar_item(con, query)
+        if not item:
+            return "Dat item ken ik nog niet. Kijk met '/winkel' wat er te koop is."
+        owned = con.execute(
+            """
+            SELECT 1 FROM user_avatar_items
+            WHERE user_id = ? AND avatar_id = ? AND item_id = ?
+            """,
+            (user_id, avatar["id"], item["id"]),
+        ).fetchone()
+        if owned:
+            return f"{avatar['symbol']} {avatar['name']} heeft {item['symbol']} {item['name']} al."
+        coins = user_coin_balance(con, user_id)
+        price = int(item["price"] or 0)
+        if coins < price:
+            return f"Nog niet genoeg munten voor {item['symbol']} {item['name']}. Nodig: {price} 🪙, jij hebt {coin_count(coins)} 🪙."
+        con.execute("UPDATE users SET learn_coins = learn_coins - ?, last_seen_at = ? WHERE id = ?", (price, dt(now()), user_id))
+        con.execute(
+            "INSERT INTO user_avatar_items(user_id, avatar_id, item_id, purchased_at) VALUES (?, ?, ?, ?)",
+            (user_id, avatar["id"], item["id"], dt(now())),
+        )
+        remaining = coins - price
+    return f"Gekocht voor {avatar['symbol']} {avatar['name']}: {item['symbol']} {item['name']}! Over: {coin_count(remaining)} 🪙."
+
+
+def handle_avatar_command(user_id: int, text: str) -> str | None:
+    cleaned = normalize(text)
+    if cleaned in {"avatars", "avatar", "plaatjes", "collectie", "goden"}:
+        return avatar_collection_text(user_id)
+    if cleaned in {"mijnavatar", "mijn avatar", "mijnplaat", "mijn plaat"}:
+        return avatar_status_text(user_id)
+    if cleaned in {"winkel", "shop"}:
+        return avatar_shop_text(user_id)
+    for prefix in ("kiesavatar ", "kies avatar ", "kiesplaat ", "kies plaat "):
+        if cleaned.startswith(prefix):
+            return set_active_avatar(user_id, cleaned[len(prefix):].strip())
+    for prefix in ("koop avatar ", "koop god "):
+        if cleaned.startswith(prefix):
+            return buy_avatar(user_id, cleaned[len(prefix):].strip())
+    if cleaned.startswith("koop "):
+        query = cleaned.removeprefix("koop ").strip()
+        with db() as con:
+            avatar = find_avatar(con, query)
+        if avatar:
+            return buy_avatar(user_id, query)
+        return buy_avatar_item(user_id, query)
+    return None
+
+
+def is_avatar_command(text: str) -> bool:
+    cleaned = normalize(text)
+    return (
+        cleaned in {"avatars", "avatar", "plaatjes", "collectie", "goden", "mijnavatar", "mijn avatar", "mijnplaat", "mijn plaat", "winkel", "shop"}
+        or cleaned.startswith("kiesavatar ")
+        or cleaned.startswith("kies avatar ")
+        or cleaned.startswith("kiesplaat ")
+        or cleaned.startswith("kies plaat ")
+        or cleaned.startswith("koop ")
+    )
 
 
 def score_delta_text(change: dict[str, Any]) -> str:
@@ -891,6 +1242,8 @@ def reset_user(user_id: int) -> sqlite3.Row:
         con.execute("DELETE FROM prompts WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM quiz_sessions WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM user_words WHERE user_id = ?", (user_id,))
+        con.execute("DELETE FROM user_avatar_items WHERE user_id = ?", (user_id,))
+        con.execute("DELETE FROM user_avatars WHERE user_id = ?", (user_id,))
         con.execute(
             """
             UPDATE users
@@ -1807,6 +2160,9 @@ def help_text(registered: bool = True, name: str | None = None) -> str:
         "/toets 10 - start een toetsronde van 10 woorden",
         "/toets struikel - toets eerdere fouten voor extra score",
         "/leer - oefen met meerkeuze en uitleg; verdien oefenmunten",
+        "/avatars - bekijk en koop Griekse goden",
+        "/winkel - koop versiering voor je actieve avatar",
+        "/mijnavatar - bekijk je actieve verzamelplaat",
         "/hint - krijg hulp bij een open vraag",
         "/beloning - spreek een weekdoel en beloning af",
         "/reset - reset naam en statistiek voor deze gebruiker",
@@ -1884,7 +2240,11 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
         if cleaned in {"quiz", "vraag", "toets", "uitleg", "leer", "ja"} or text.strip().startswith("/"):
             return help_text(registered=False)
         user = set_user_name(user["id"], text)
-        return f"Leuk je te leren kennen, {user['name']}!\n\n{help_text(name=user['name'])}"
+        return (
+            f"Leuk je te leren kennen, {user['name']}!\n"
+            "Je eerste avatar is gratis vrijgespeeld: 🦉 Athena.\n\n"
+            f"{help_text(name=user['name'])}"
+        )
 
     prompt = active_prompt(user["id"])
 
@@ -1894,7 +2254,12 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
         return help_text(name=user["name"])
 
     if bool(row_value(user, "pending_reset", 0)):
-        if cleaned in {"leer", "uitleg", "oefen", "oefenen", "status", "score"} or cleaned.startswith("beloning") or parse_toets_request(cleaned):
+        if (
+            cleaned in {"leer", "uitleg", "oefen", "oefenen", "status", "score"}
+            or cleaned.startswith("beloning")
+            or is_avatar_command(text)
+            or parse_toets_request(cleaned)
+        ):
             set_pending_reset(user["id"], False)
             user = get_or_create_user(user["platform"], user["external_id"])
         elif is_yes(text) or cleaned in {"reset bevestig", "reset nu"}:
@@ -1947,6 +2312,10 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
         if prompt:
             mark_expired(user["id"])
         return new_quiz_text(user["id"], "uitleg")
+
+    avatar_response = handle_avatar_command(user["id"], text)
+    if avatar_response is not None:
+        return avatar_response
 
     if not prompt:
         if is_yes(text):
