@@ -970,6 +970,33 @@ def apply_learn_result(user_id: int, correct: bool) -> dict[str, Any]:
     return {"old_coins": old_coins, "new_coins": new_coins, "delta": delta}
 
 
+def test_commands_enabled() -> bool:
+    return ENV.get("TEST_COMMANDS_ENABLED", "true").lower() in {"1", "true", "yes", "ja"}
+
+
+def handle_test_coin_command(user_id: int, text: str) -> str | None:
+    cleaned = normalize(text)
+    if not cleaned.startswith("testmunt"):
+        return None
+    if not test_commands_enabled():
+        return "Testmunten staan uit op deze server."
+    amount = 100
+    match = re.search(r"[-+]?\d+", text)
+    if match:
+        amount = int(match.group(0))
+    amount = max(-1000, min(1000, amount))
+    with db() as con:
+        user = con.execute("SELECT learn_coins FROM users WHERE id = ?", (user_id,)).fetchone()
+        old_coins = float(user["learn_coins"] or 0)
+        new_coins = max(0.0, old_coins + amount)
+        con.execute(
+            "UPDATE users SET learn_coins = ?, last_seen_at = ? WHERE id = ?",
+            (new_coins, dt(now()), user_id),
+        )
+    sign = "+" if amount >= 0 else ""
+    return f"Testmunten: {sign}{amount} 🪙. Totaal: {coin_count(new_coins)} 🪙."
+
+
 def user_coin_balance(con: sqlite3.Connection, user_id: int) -> float:
     row = con.execute("SELECT learn_coins FROM users WHERE id = ?", (user_id,)).fetchone()
     return float(row["learn_coins"] or 0) if row else 0.0
@@ -2403,6 +2430,7 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
         if (
             cleaned in {"leer", "uitleg", "oefen", "oefenen", "status", "score"}
             or cleaned.startswith("beloning")
+            or cleaned.startswith("testmunt")
             or is_avatar_command(text)
             or parse_toets_request(cleaned)
         ):
@@ -2426,6 +2454,10 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
     if cleaned in {"reset bevestig", "reset nu"}:
         reset_user(user["id"])
         return "Reset klaar. Je naam en statistiek zijn gewist.\n\n" + help_text(registered=False)
+
+    test_coin_response = handle_test_coin_command(user["id"], text)
+    if test_coin_response is not None:
+        return test_coin_response
 
     toets_request = parse_toets_request(cleaned)
     if toets_request:
