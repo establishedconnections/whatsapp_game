@@ -241,6 +241,8 @@ HINT_SCORE=0.5
 
 Hints worden per Grieks woord opgeslagen in de database. De eerste hint kan dus via OpenAI gemaakt worden; daarna wordt dezelfde hint goedkoop hergebruikt voor dat woord.
 
+In `/leer` gebruikt de bot ook een korte AI-les per woord. Die uitleg wordt per woord opgeslagen in de database, zodat dezelfde uitleg later goedkoop opnieuw gebruikt wordt.
+
 Met `/reset` krijgt de gebruiker een bevestigingsvraag. Met `/reset bevestig` worden naam, open vragen, toetsrondes en statistiek voor die Telegram-gebruiker gewist.
 
 Bij een fout antwoord krijgt hij nu een korte uitleg:
