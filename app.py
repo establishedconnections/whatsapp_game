@@ -452,6 +452,7 @@ def init_db() -> None:
                 last_play_date TEXT,
                 last_decay_date TEXT,
                 last_reminder_at TEXT,
+                pending_reset INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 UNIQUE(platform, external_id)
@@ -556,6 +557,8 @@ def init_db() -> None:
             con.execute("ALTER TABLE users ADD COLUMN last_decay_date TEXT")
         if "last_reminder_at" not in user_columns:
             con.execute("ALTER TABLE users ADD COLUMN last_reminder_at TEXT")
+        if "pending_reset" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN pending_reset INTEGER NOT NULL DEFAULT 0")
         word_columns = {row[1] for row in con.execute("PRAGMA table_info(words)")}
         if "hint_text" not in word_columns:
             con.execute("ALTER TABLE words ADD COLUMN hint_text TEXT")
@@ -773,6 +776,7 @@ def reset_user(user_id: int) -> sqlite3.Row:
             SET name = NULL, awaiting_name = 1, last_mode = 'toets',
                 game_score = 0, correct_streak = 0, wrong_streak = 0,
                 last_play_date = NULL, last_decay_date = NULL, last_reminder_at = NULL,
+                pending_reset = 0,
                 last_seen_at = ?
             WHERE id = ?
             """,
@@ -780,6 +784,11 @@ def reset_user(user_id: int) -> sqlite3.Row:
         )
         initialize_user_words(con, user_id)
         return con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def set_pending_reset(user_id: int, pending: bool) -> None:
+    with db() as con:
+        con.execute("UPDATE users SET pending_reset = ?, last_seen_at = ? WHERE id = ?", (1 if pending else 0, dt(now()), user_id))
 
 
 def choose_word(user_id: int) -> sqlite3.Row:
@@ -1623,7 +1632,16 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
     if cleaned in {"start", "help", "hulp"} or text.strip() in {"/start", "/help"}:
         return help_text(name=user["name"])
 
+    if bool(row_value(user, "pending_reset", 0)):
+        if is_yes(text) or cleaned in {"reset bevestig", "reset nu"}:
+            reset_user(user["id"])
+            return "Reset klaar. Je naam en statistiek zijn gewist.\n\n" + help_text(registered=False)
+        if is_no(text):
+            set_pending_reset(user["id"], False)
+            return "Reset geannuleerd. Je gegevens blijven bewaard."
+
     if cleaned == "reset":
+        set_pending_reset(user["id"], True)
         return "Weet je het zeker? Stuur '/reset bevestig' om je naam en statistiek voor deze gebruiker te wissen."
     if cleaned in {"reset bevestig", "reset nu"}:
         reset_user(user["id"])
