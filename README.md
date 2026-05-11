@@ -4,13 +4,13 @@ Een kleine Telegram/WhatsApp-quizbackend voor de Griekse werkwoordenlijst t/m le
 
 ## Wat doet dit?
 
-- Stuurt op ingestelde momenten een Grieks werkwoord naar je zoon.
-- Hij heeft 5 minuten om te antwoorden met de Nederlandse vertaling.
+- De leerling start zelf toetsrondes met bijvoorbeeld `/toets 10`.
+- De bot stuurt op ingestelde momenten alleen score-reminders, geen losse quizwoorden.
 - De backend geeft direct feedback via Telegram of WhatsApp.
 - Resultaten worden opgeslagen in SQLite.
 - Woorden die fout gaan komen vaker terug; woorden die goed gaan komen minder vaak.
 - Na elk antwoord vraagt de bot: "Wil je er nog een?"
-- Weekscore met beloningen, bijvoorbeeld ijsje / bios-bezoek / t-shirt.
+- Game-score van 0-100% met streak-bonussen, foutreeksen en dagelijkse onderhoudsdruk.
 - Kleine uitleg na een fout antwoord.
 - Grappige micro-beloningstekst na een goed antwoord.
 - Meerdere gebruikers met eigen naam, eigen score en eigen herhalingsschema.
@@ -46,7 +46,7 @@ Zo werkt het:
 /toets struikel - toets woorden die eerder fout gingen
 /leer - oefen foute woorden met meerkeuze en uitleg
 /hint - krijg hulp bij een open vraag
-status - bekijk je weekscore en beloning
+status - bekijk je game-score
 
 Hoe heet je? Stuur je naam, dan maak ik je profiel aan.
 ```
@@ -164,7 +164,7 @@ Voor `POST /admin/send-now` kun je leeg posten; de backend kiest dan zelf een wo
 
 ## Speelschema instellen
 
-In `.env` kun je instellen wanneer geplande quizvragen mogen komen.
+In `.env` kun je instellen wanneer de bot reminders mag sturen. De scheduler stuurt geen quizwoorden meer; hij stuurt alleen je actuele score en een herinnering om zelf `/toets 10` te starten.
 
 ```env
 QUIZ_DAYS=mon,tue,wed,thu,fri,sat,sun
@@ -185,7 +185,7 @@ Je kunt meerdere blokken gebruiken met puntkomma's:
 QUIZ_BLOCK_WINDOWS=mon-fri 08:15-15:15; tue 17:00-18:00
 ```
 
-Handmatige vragen via `/admin/send-now` of antwoorden met `ja` mogen wel meteen doorgaan. Alleen de automatische scheduler houdt zich aan het speelschema.
+Handmatig spelen via `/toets`, `/leer` of antwoorden met `ja` mag wel meteen doorgaan. Alleen automatische reminders houden zich aan het speelschema.
 
 ## Antwoordregels
 
@@ -231,9 +231,9 @@ Je kunt een toetsronde starten met een vast aantal woorden:
 
 Als hij `nee`, `stop`, `klaar` of `later` stuurt, stopt de speelsessie rustig.
 
-Met `status`, `score` of `beloning` krijgt hij de weekscore te zien.
+Met `status`, `score` of `beloning` krijgt hij de game-score te zien.
 
-Met `/hint`, `hint`, `tip` of `hulp` krijgt hij een hulpje richting het antwoord, zonder dat het antwoord letterlijk verklapt wordt. In `/toets` telt een goed antwoord na een hint standaard voor een half punt in de weekscore:
+Met `/hint`, `hint`, `tip` of `hulp` krijgt hij een hulpje richting het antwoord, zonder dat het antwoord letterlijk verklapt wordt. In `/toets` levert een goed antwoord na een hint minder game-score op:
 
 ```env
 HINT_SCORE=0.5
@@ -263,16 +263,19 @@ GOOD_MICRO_REWARDS=Mini-beloning: Grieks brein unlocked.|Level up. Woord verslag
 MISS_MICRO_TEXTS=Geen drama, dit is precies hoe herhalen werkt.|Deze gaat op de revanche-lijst.
 ```
 
-## Weekbeloningen
+## Game-score
 
-De beloningen staan in `.env`:
+De game-score begint op 0% en loopt omhoog door toetsvragen goed te beantwoorden. Streaks geven extra boost; een los fout antwoord doet weinig pijn, maar een foutreeks kost meer. Als er een dag niet gespeeld wordt, daalt de score.
 
 ```env
-WEEKLY_GOAL_MIN_ANSWERS=10
-REWARD_60=ijsje
-REWARD_75=bios-bezoek
-REWARD_90=t-shirt
+GAME_CORRECT_POINTS=2
+GAME_HINT_MULTIPLIER=0.5
+GAME_STREAK_3_BONUS=1
+GAME_STREAK_5_BONUS=3
+GAME_STREAK_10_BONUS=5
+GAME_SINGLE_WRONG_PENALTY=0.5
+GAME_WRONG_STREAK_PENALTY=2
+GAME_DAILY_MISS_PENALTY=5
+REMINDER_TIMES=16:30,19:00
+REMINDER_MIN_GAP_HOURS=6
 ```
-
-Het percentage telt zodra er minstens `WEEKLY_GOAL_MIN_ANSWERS` woorden in die week zijn beantwoord. De week begint op maandag.
-De weekscore rekent met punten: goed zonder hint is 1 punt, goed na een hint is `HINT_SCORE`, fout is 0.

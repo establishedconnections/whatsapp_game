@@ -446,6 +446,12 @@ def init_db() -> None:
                 name TEXT,
                 awaiting_name INTEGER NOT NULL DEFAULT 1,
                 last_mode TEXT NOT NULL DEFAULT 'toets',
+                game_score REAL NOT NULL DEFAULT 0,
+                correct_streak INTEGER NOT NULL DEFAULT 0,
+                wrong_streak INTEGER NOT NULL DEFAULT 0,
+                last_play_date TEXT,
+                last_decay_date TEXT,
+                last_reminder_at TEXT,
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 UNIQUE(platform, external_id)
@@ -538,6 +544,18 @@ def init_db() -> None:
         user_columns = {row[1] for row in con.execute("PRAGMA table_info(users)")}
         if "last_mode" not in user_columns:
             con.execute("ALTER TABLE users ADD COLUMN last_mode TEXT NOT NULL DEFAULT 'toets'")
+        if "game_score" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN game_score REAL NOT NULL DEFAULT 0")
+        if "correct_streak" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN correct_streak INTEGER NOT NULL DEFAULT 0")
+        if "wrong_streak" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN wrong_streak INTEGER NOT NULL DEFAULT 0")
+        if "last_play_date" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN last_play_date TEXT")
+        if "last_decay_date" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN last_decay_date TEXT")
+        if "last_reminder_at" not in user_columns:
+            con.execute("ALTER TABLE users ADD COLUMN last_reminder_at TEXT")
         word_columns = {row[1] for row in con.execute("PRAGMA table_info(words)")}
         if "hint_text" not in word_columns:
             con.execute("ALTER TABLE words ADD COLUMN hint_text TEXT")
@@ -612,6 +630,138 @@ def set_user_mode(user_id: int, mode: str) -> None:
         con.execute("UPDATE users SET last_mode = ?, last_seen_at = ? WHERE id = ?", (mode, dt(now()), user_id))
 
 
+def clamp_score(value: float) -> float:
+    return min(100.0, max(0.0, value))
+
+
+def today_key(at: datetime | None = None) -> str:
+    return (at or now()).date().isoformat()
+
+
+def game_score_delta(correct: bool, used_hint: bool, correct_streak: int, wrong_streak: int) -> float:
+    if correct:
+        base = float(ENV.get("GAME_CORRECT_POINTS", "2"))
+        if used_hint:
+            base *= float(ENV.get("GAME_HINT_MULTIPLIER", "0.5"))
+        if correct_streak and correct_streak % 10 == 0:
+            base += float(ENV.get("GAME_STREAK_10_BONUS", "5"))
+        elif correct_streak and correct_streak % 5 == 0:
+            base += float(ENV.get("GAME_STREAK_5_BONUS", "3"))
+        elif correct_streak and correct_streak % 3 == 0:
+            base += float(ENV.get("GAME_STREAK_3_BONUS", "1"))
+        return base
+    if wrong_streak <= 1:
+        return -float(ENV.get("GAME_SINGLE_WRONG_PENALTY", "0.5"))
+    return -float(ENV.get("GAME_WRONG_STREAK_PENALTY", "2")) * wrong_streak
+
+
+def apply_game_result(user_id: int, correct: bool, used_hint: bool = False) -> dict[str, Any]:
+    with db() as con:
+        user = con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        old_score = float(user["game_score"] or 0)
+        correct_streak = int(user["correct_streak"] or 0)
+        wrong_streak = int(user["wrong_streak"] or 0)
+        if correct:
+            correct_streak += 1
+            wrong_streak = 0
+        else:
+            wrong_streak += 1
+            correct_streak = 0
+        delta = game_score_delta(correct, used_hint, correct_streak, wrong_streak)
+        new_score = clamp_score(old_score + delta)
+        con.execute(
+            """
+            UPDATE users
+            SET game_score = ?, correct_streak = ?, wrong_streak = ?,
+                last_play_date = ?, last_seen_at = ?
+            WHERE id = ?
+            """,
+            (new_score, correct_streak, wrong_streak, today_key(), dt(now()), user_id),
+        )
+    return {
+        "old_score": old_score,
+        "new_score": new_score,
+        "delta": delta,
+        "correct_streak": correct_streak,
+        "wrong_streak": wrong_streak,
+    }
+
+
+def score_delta_text(change: dict[str, Any]) -> str:
+    sign = "+" if change["delta"] >= 0 else ""
+    streak = ""
+    if change["correct_streak"] >= 3:
+        streak = f" Reeks: {change['correct_streak']} goed."
+    if change["wrong_streak"] >= 2:
+        streak = f" Oei, {change['wrong_streak']} fout achter elkaar."
+    return f"Score: {change['new_score']:.1f}% ({sign}{change['delta']:.1f}).{streak}"
+
+
+def apply_daily_decay(user_id: int, at: datetime | None = None) -> dict[str, Any] | None:
+    at = at or now()
+    today = today_key(at)
+    with db() as con:
+        user = con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        last_play = user["last_play_date"]
+        last_decay = user["last_decay_date"]
+        if not last_play or last_decay == today:
+            return None
+        try:
+            last_play_date = datetime.fromisoformat(last_play).date()
+        except ValueError:
+            return None
+        missed_days = (at.date() - last_play_date).days - 1
+        if missed_days <= 0:
+            return None
+        penalty = float(ENV.get("GAME_DAILY_MISS_PENALTY", "5")) * missed_days
+        old_score = float(user["game_score"] or 0)
+        new_score = clamp_score(old_score - penalty)
+        con.execute(
+            """
+            UPDATE users
+            SET game_score = ?, correct_streak = 0, wrong_streak = 0, last_decay_date = ?
+            WHERE id = ?
+            """,
+            (new_score, today, user_id),
+        )
+    return {"old_score": old_score, "new_score": new_score, "delta": -penalty, "missed_days": missed_days}
+
+
+def game_status(user_id: int) -> dict[str, Any]:
+    apply_daily_decay(user_id)
+    with db() as con:
+        user = con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    played_today = user["last_play_date"] == today_key()
+    return {
+        "score": float(user["game_score"] or 0),
+        "correct_streak": int(user["correct_streak"] or 0),
+        "wrong_streak": int(user["wrong_streak"] or 0),
+        "played_today": played_today,
+        "last_play_date": user["last_play_date"],
+    }
+
+
+def game_status_text(user_id: int) -> str:
+    status = game_status(user_id)
+    line = f"Game-score: {status['score']:.1f}%."
+    if status["correct_streak"]:
+        line += f" Reeks: {status['correct_streak']} goed."
+    if status["wrong_streak"] >= 2:
+        line += f" Foutreeks: {status['wrong_streak']}."
+    if status["played_today"]:
+        line += " Vandaag gespeeld."
+    else:
+        line += " Nog niet gespeeld vandaag: start met '/toets 10'."
+    return line
+
+
+def reminder_text(user_id: int) -> str:
+    status = game_status(user_id)
+    if status["played_today"]:
+        return f"Je score staat op {status['score']:.1f}%. Lekker bezig. Nog een ronde? Stuur '/toets 10'."
+    return f"Je score staat op {status['score']:.1f}%. Speel vandaag een quiz om je score vast te houden: stuur '/toets 10'."
+
+
 def reset_user(user_id: int) -> sqlite3.Row:
     with db() as con:
         con.execute("DELETE FROM prompts WHERE user_id = ?", (user_id,))
@@ -620,7 +770,10 @@ def reset_user(user_id: int) -> sqlite3.Row:
         con.execute(
             """
             UPDATE users
-            SET name = NULL, awaiting_name = 1, last_mode = 'toets', last_seen_at = ?
+            SET name = NULL, awaiting_name = 1, last_mode = 'toets',
+                game_score = 0, correct_streak = 0, wrong_streak = 0,
+                last_play_date = NULL, last_decay_date = NULL, last_reminder_at = NULL,
+                last_seen_at = ?
             WHERE id = ?
             """,
             (dt(now()), user_id),
@@ -1347,6 +1500,10 @@ def weekly_progress(user_id: int) -> dict[str, Any]:
 
 
 def weekly_progress_text(user_id: int) -> str:
+    return game_status_text(user_id)
+
+
+def legacy_weekly_progress_text(user_id: int) -> str:
     progress = weekly_progress(user_id)
     points = f"{progress['points']:.1f}".rstrip("0").rstrip(".")
     base = f"Weekscore: {points}/{progress['answered']} punten ({progress['percent']}%)."
@@ -1385,7 +1542,7 @@ def help_text(registered: bool = True, name: str | None = None) -> str:
         "/leer - oefen foute woorden met meerkeuze en uitleg",
         "/hint - krijg hulp bij een open vraag",
         "/reset - reset naam en statistiek voor deze gebruiker",
-        "status - bekijk je weekscore en beloning",
+        "status - bekijk je game-score",
         "",
     ]
     if registered:
@@ -1516,7 +1673,7 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
             with db() as con:
                 con.execute("UPDATE users SET awaiting_name = 1 WHERE id = ?", (user["id"],))
             return "Hoe heet je?"
-        return "Er staat nu geen quizvraag open. Stuur '/toets' voor score, '/leer' om te oefenen, of 'status' voor je weekscore."
+        return "Er staat nu geen quizvraag open. Stuur '/toets' om je score te verhogen, '/leer' om te oefenen, of 'status' voor je game-score."
 
     if is_yes(text):
         return quiz_text(prompt)
@@ -1580,6 +1737,11 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
         )
 
     update_word_after_answer(prompt, text, correct)
+    game_change = apply_game_result(
+        user["id"],
+        correct,
+        used_hint=bool(row_value(prompt, "hint_used", 0)),
+    )
     session_id = row_value(prompt, "session_id")
     if session_id:
         progress = session_progress(int(session_id))
@@ -1589,25 +1751,26 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
             return (
                 f"{result_line}\n{prompt['greek']} = {prompt['meaning']}.\n"
                 f"{format_session_finished(progress)}\n"
-                f"{weekly_progress_text(user['id'])}\n"
+                f"{score_delta_text(game_change)}\n"
                 "Stuur '/leer' om de fouten na te bespreken, of '/toets 10' voor een nieuwe ronde."
             )
         next_text = new_quiz_text(user["id"], "toets", session_id=int(session_id), source=progress["source"])
         result_line = f"Goed, {user['name']}! ✅" if correct else f"Bijna, maar niet goed. {miss_micro_text()}"
         result = (
             f"{result_line}\n{prompt['greek']} = {prompt['meaning']}.\n"
-            f"{format_session_progress(progress)}"
+            f"{format_session_progress(progress)}\n"
+            f"{score_delta_text(game_change)}"
         )
         return separated_result(result, next_text)
     if correct:
         ai_note = ""
         if ai_result and ai_result.get("reason_dutch"):
             ai_note = f"\nIk telde dit goed: {ai_result['reason_dutch']}"
-        return f"Goed, {user['name']}! ✅\n{prompt['greek']} = {prompt['meaning']}{ai_note}\n{success_micro_reward()}\n{weekly_progress_text(user['id'])}\n{ask_more_text_for_mode(mode)}"
+        return f"Goed, {user['name']}! ✅\n{prompt['greek']} = {prompt['meaning']}{ai_note}\n{success_micro_reward()}\n{score_delta_text(game_change)}\n{ask_more_text_for_mode(mode)}"
     feedback = ""
     if ai_result and ai_result.get("safe_feedback_dutch"):
         feedback = f"\n{ai_result['safe_feedback_dutch']}"
-    return f"Bijna, maar niet goed. {miss_micro_text()}{feedback}\nHet juiste antwoord is: {prompt['meaning']}.\n{explanation(prompt)}\n{weekly_progress_text(user['id'])}\n{ask_more_text_for_mode(mode)}"
+    return f"Bijna, maar niet goed. {miss_micro_text()}{feedback}\nHet juiste antwoord is: {prompt['meaning']}.\n{explanation(prompt)}\n{score_delta_text(game_change)}\n{ask_more_text_for_mode(mode)}"
 
 
 def stats() -> dict[str, Any]:
@@ -1646,7 +1809,9 @@ def stats() -> dict[str, Any]:
         ).fetchall()
         users = con.execute(
             """
-            SELECT id, platform, external_id, name, awaiting_name, last_mode, created_at, last_seen_at
+            SELECT id, platform, external_id, name, awaiting_name, last_mode,
+                   game_score, correct_streak, wrong_streak, last_play_date,
+                   last_decay_date, last_reminder_at, created_at, last_seen_at
             FROM users
             ORDER BY last_seen_at DESC
             """
@@ -1763,13 +1928,31 @@ def in_quiz_window() -> bool:
     return bool(schedule_status()["allowed"])
 
 
+def reminder_due(user: sqlite3.Row) -> bool:
+    if user["awaiting_name"] or not user["name"]:
+        return False
+    if active_prompt(user["id"]):
+        return False
+    last = parse_dt(row_value(user, "last_reminder_at"))
+    gap_hours = float(ENV.get("REMINDER_MIN_GAP_HOURS", "6"))
+    if last and now() - last < timedelta(hours=gap_hours):
+        return False
+    preferred = ENV.get("REMINDER_TIMES", "16:30,19:00")
+    current = now().strftime("%H:%M")
+    return any(abs(minutes(current) - minutes(item.strip())) <= 15 for item in preferred.split(",") if item.strip())
+
+
+def mark_reminded(user_id: int) -> None:
+    with db() as con:
+        con.execute("UPDATE users SET last_reminder_at = ? WHERE id = ?", (dt(now()), user_id))
+
+
 def scheduler_loop() -> None:
-    next_send = now() + timedelta(minutes=2)
     while True:
         try:
             mark_expired()
             enabled = ENV.get("QUIZ_ENABLED", "true").lower() == "true"
-            if enabled and in_quiz_window() and now() >= next_send:
+            if enabled and in_quiz_window():
                 with db() as con:
                     users = con.execute(
                         """
@@ -1779,12 +1962,13 @@ def scheduler_loop() -> None:
                         """
                     ).fetchall()
                 for user in users:
-                    if not active_prompt(user["id"]):
-                        send_quiz_now(user["id"], to=user["external_id"])
-                low = int(ENV.get("QUIZ_MIN_GAP_MINUTES", "45"))
-                high = int(ENV.get("QUIZ_MAX_GAP_MINUTES", "180"))
-                next_send = now() + timedelta(minutes=random.randint(low, high))
-                log_event("next_send_scheduled", {"next_send": dt(next_send)})
+                    decay = apply_daily_decay(user["id"])
+                    if decay:
+                        log_event("score_decay", {"user_id": user["id"], **decay})
+                    if reminder_due(user):
+                        send_message(reminder_text(user["id"]), to=user["external_id"])
+                        mark_reminded(user["id"])
+                        log_event("reminder_sent", {"user_id": user["id"], "to": user["external_id"]})
         except Exception as exc:
             log_event("scheduler_error", {"error": repr(exc)})
         time.sleep(30)
