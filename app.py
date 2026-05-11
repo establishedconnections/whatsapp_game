@@ -11,6 +11,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -196,18 +197,37 @@ def is_correct(answer: str, meaning: str) -> bool:
     return any(given == part or given in part or part in given for part in parts)
 
 
-def explanation(row: sqlite3.Row) -> str:
+def explanation(row: sqlite3.Row, include_tip: bool = True) -> str:
     accepted = ", ".join(answer_parts(row["meaning"]))
     forms = [
         f"praesens: {row['greek']}",
         f"imperfectum: {row['imperfectum'] or '-'}",
         f"aoristus: {row['aoristus'] or '-'}",
     ]
-    tip = f"Tip: ik accepteer o.a. {accepted}."
-    mnemonic = MNEM.get(row["greek"])
-    if mnemonic:
-        tip += f" Ezelsbrug: {mnemonic}"
-    return f"{tip}\nKern: {row['greek']} = {row['meaning']}.\n" + " | ".join(forms)
+    lines = []
+    if include_tip:
+        tip = f"Tip: ik accepteer o.a. {accepted}."
+        mnemonic = MNEM.get(row["greek"])
+        if mnemonic:
+            tip += f" Ezelsbrug: {mnemonic}"
+        lines.append(tip)
+    lines.append(f"Kern: {row['greek']} = {row['meaning']}.")
+    lines.append(" | ".join(forms))
+    return "\n".join(lines)
+
+
+def strip_greek_accents(text: str) -> str:
+    text = unicodedata.normalize("NFD", text.strip().lower())
+    text = "".join(char for char in text if unicodedata.category(char) != "Mn")
+    text = text.replace("ς", "σ")
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def greek_matches(answer: str, expected: str | None) -> bool:
+    if not expected:
+        return False
+    return strip_greek_accents(answer) == strip_greek_accents(expected)
 
 
 AI_GRADE_SCHEMA = {
@@ -592,6 +612,23 @@ def set_user_mode(user_id: int, mode: str) -> None:
         con.execute("UPDATE users SET last_mode = ?, last_seen_at = ? WHERE id = ?", (mode, dt(now()), user_id))
 
 
+def reset_user(user_id: int) -> sqlite3.Row:
+    with db() as con:
+        con.execute("DELETE FROM prompts WHERE user_id = ?", (user_id,))
+        con.execute("DELETE FROM quiz_sessions WHERE user_id = ?", (user_id,))
+        con.execute("DELETE FROM user_words WHERE user_id = ?", (user_id,))
+        con.execute(
+            """
+            UPDATE users
+            SET name = NULL, awaiting_name = 1, last_mode = 'toets', last_seen_at = ?
+            WHERE id = ?
+            """,
+            (dt(now()), user_id),
+        )
+        initialize_user_words(con, user_id)
+        return con.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
 def choose_word(user_id: int) -> sqlite3.Row:
     with db() as con:
         initialize_user_words(con, user_id)
@@ -795,12 +832,55 @@ def create_choices(con: sqlite3.Connection, word_id: int) -> list[dict[str, Any]
     return options
 
 
+def create_meaning_choices(con: sqlite3.Connection, word_id: int) -> list[dict[str, Any]]:
+    return create_choices(con, word_id)
+
+
+def create_learning_exercise(con: sqlite3.Connection, word_id: int) -> dict[str, Any]:
+    word = con.execute("SELECT * FROM words WHERE id = ?", (word_id,)).fetchone()
+    available = ["meaning_choice"]
+    if word["imperfectum"]:
+        available.extend(["imperfectum_text", "imperfectum_meaning_choice"])
+    if word["aoristus"]:
+        available.extend(["aoristus_text", "aoristus_meaning_choice"])
+    kind = random.choice(available)
+    if kind == "meaning_choice":
+        return {
+            "type": kind,
+            "question": f"Wat betekent {word['greek']}?",
+            "choices": create_meaning_choices(con, word_id),
+        }
+    if kind == "imperfectum_text":
+        return {
+            "type": kind,
+            "question": f"Wat is het imperfectum van {word['greek']}?",
+            "expected": word["imperfectum"],
+            "answer_label": "imperfectum",
+        }
+    if kind == "aoristus_text":
+        return {
+            "type": kind,
+            "question": f"Wat is de aoristus van {word['greek']}?",
+            "expected": word["aoristus"],
+            "answer_label": "aoristus",
+        }
+    form_name = "imperfectum" if kind == "imperfectum_meaning_choice" else "aoristus"
+    form_value = word["imperfectum"] if form_name == "imperfectum" else word["aoristus"]
+    return {
+        "type": kind,
+        "question": f"Welke Nederlandse betekenis hoort bij de {form_name} {form_value}?",
+        "choices": create_meaning_choices(con, word_id),
+        "form_name": form_name,
+        "form_value": form_value,
+    }
+
+
 def create_prompt(user_id: int, word_id: int, mode: str = "toets", session_id: int | None = None) -> sqlite3.Row:
     timeout = int(ENV.get("ANSWER_TIMEOUT_MINUTES", "5"))
     sent = now()
     expires = sent + timedelta(minutes=timeout)
     with db() as con:
-        choices_json = json.dumps(create_choices(con, word_id), ensure_ascii=False) if mode == "uitleg" else None
+        choices_json = json.dumps(create_learning_exercise(con, word_id), ensure_ascii=False) if mode == "uitleg" else None
         cur = con.execute(
             "INSERT INTO prompts(user_id, word_id, sent_at, expires_at, mode, choices_json, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (user_id, word_id, dt(sent), dt(expires), mode, choices_json, session_id),
@@ -821,23 +901,36 @@ def create_prompt(user_id: int, word_id: int, mode: str = "toets", session_id: i
 def quiz_text(prompt: sqlite3.Row) -> str:
     mins = ENV.get("ANSWER_TIMEOUT_MINUTES", "5")
     if row_value(prompt, "mode", "toets") == "uitleg":
+        exercise = prompt_exercise(prompt)
         choices = prompt_choices(prompt)
+        question = exercise.get("question") or f"Wat betekent {prompt['greek']}?"
         if choices:
             options = "\n".join(f"{choice['label']}. {choice['meaning']}" for choice in choices)
-            return f"Uitlegwoord: {prompt['greek']}\nKies het beste antwoord. Dit telt niet mee voor je score.\n{options}"
-        return f"Uitlegwoord: {prompt['greek']}\nProbeer de Nederlandse vertaling. Dit telt niet mee voor je score."
-    return f"Toetswoord: {prompt['greek']}\nWat is de Nederlandse vertaling? Je hebt {mins} minuten."
+            return f"📚 LEERWOORD\n{prompt['greek']}\n\n{question}\nDit telt niet mee voor je score.\n{options}"
+        return f"📚 LEERWOORD\n{prompt['greek']}\n\n{question}\nDit telt niet mee voor je score."
+    return f"🎯 TOETSWOORD\n{prompt['greek']}\n\nWat is de Nederlandse vertaling? Je hebt {mins} minuten."
+
+
+def prompt_exercise(prompt: sqlite3.Row) -> dict[str, Any]:
+    raw = row_value(prompt, "choices_json", "")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return {"type": "meaning_choice", "choices": data}
+    return {}
 
 
 def prompt_choices(prompt: sqlite3.Row) -> list[dict[str, Any]]:
-    raw = row_value(prompt, "choices_json", "")
-    if not raw:
+    choices = prompt_exercise(prompt).get("choices", [])
+    if not isinstance(choices, list):
         return []
-    try:
-        choices = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    return choices if isinstance(choices, list) else []
+    return choices
 
 
 def selected_choice(prompt: sqlite3.Row, answer: str) -> dict[str, Any] | None:
@@ -847,6 +940,18 @@ def selected_choice(prompt: sqlite3.Row, answer: str) -> dict[str, Any] | None:
         return None
     label = match.group(1)
     return next((choice for choice in prompt_choices(prompt) if choice.get("label") == label), None)
+
+
+def evaluate_learning_answer(prompt: sqlite3.Row, answer: str) -> tuple[bool, str]:
+    exercise = prompt_exercise(prompt)
+    kind = exercise.get("type", "meaning_choice")
+    choice = selected_choice(prompt, answer)
+    if choice:
+        return bool(choice.get("correct")), f"Jouw keuze: {choice['label']}. {choice['meaning']}"
+    if kind in {"imperfectum_text", "aoristus_text"}:
+        expected = exercise.get("expected", "")
+        return greek_matches(answer, expected), f"Jouw antwoord: {answer.strip()}\nGoed antwoord: {expected}"
+    return is_correct(answer, prompt["meaning"]), f"Jouw antwoord: {answer.strip()}"
 
 
 def hint_score() -> float:
@@ -1097,7 +1202,7 @@ def new_quiz_text(user_id: int, mode: str = "toets", session_id: int | None = No
     set_user_mode(user_id, mode)
     log_event("prompt_created", {"prompt_id": prompt["id"], "user_id": user_id, "word_id": prompt["word_id"], "greek": prompt["greek"], "mode": mode, "session_id": session_id, "source": source})
     if mode == "uitleg" and review_count == 0:
-        return "Je hebt nog geen foute toetswoorden om uit te leggen. We oefenen daarom een gewoon woord, zonder score.\n" + quiz_text(prompt)
+        return "Je hebt nog geen foute toetswoorden om te leren. We oefenen daarom een gewoon woord, zonder score.\n" + quiz_text(prompt)
     return quiz_text(prompt)
 
 
@@ -1265,7 +1370,7 @@ def ask_more_text() -> str:
 
 def ask_more_text_for_mode(mode: str) -> str:
     if mode == "uitleg":
-        return "Wil je nog een uitlegwoord? Antwoord met ja of nee."
+        return "Wil je nog een leerwoord? Antwoord met ja of nee."
     return ask_more_text()
 
 
@@ -1277,8 +1382,9 @@ def help_text(registered: bool = True, name: str | None = None) -> str:
         "Zo werkt het:",
         "/toets 10 - start een toetsronde van 10 woorden",
         "/toets struikel - toets woorden die eerder fout gingen",
-        "/uitleg - oefen foute woorden met meerkeuze en uitleg",
+        "/leer - oefen foute woorden met meerkeuze en uitleg",
         "/hint - krijg hulp bij een open vraag",
+        "/reset - reset naam en statistiek voor deze gebruiker",
         "status - bekijk je weekscore en beloning",
         "",
     ]
@@ -1341,12 +1447,16 @@ def miss_micro_text() -> str:
     return random.choice(lines)
 
 
+def separated_result(result: str, next_text: str) -> str:
+    return f"{result}\n\n━━━━━━━━━━━━\n➡ VOLGENDE VRAAG\n━━━━━━━━━━━━\n{next_text}"
+
+
 def handle_answer(text: str, user: sqlite3.Row) -> str:
     cleaned = normalize(text)
     if not user["name"] or user["awaiting_name"]:
         if cleaned in {"start", "help", "hulp"} or text.strip() in {"/start", "/help"}:
             return help_text(registered=False)
-        if cleaned in {"quiz", "vraag", "toets", "uitleg", "ja"} or text.strip().startswith("/"):
+        if cleaned in {"quiz", "vraag", "toets", "uitleg", "leer", "ja"} or text.strip().startswith("/"):
             return help_text(registered=False)
         user = set_user_name(user["id"], text)
         return f"Leuk je te leren kennen, {user['name']}!\n\n{help_text(name=user['name'])}"
@@ -1355,6 +1465,12 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
 
     if cleaned in {"start", "help", "hulp"} or text.strip() in {"/start", "/help"}:
         return help_text(name=user["name"])
+
+    if cleaned == "reset":
+        return "Weet je het zeker? Stuur '/reset bevestig' om je naam en statistiek voor deze gebruiker te wissen."
+    if cleaned in {"reset bevestig", "reset nu"}:
+        reset_user(user["id"])
+        return "Reset klaar. Je naam en statistiek zijn gewist.\n\n" + help_text(registered=False)
 
     toets_request = parse_toets_request(cleaned)
     if toets_request:
@@ -1376,7 +1492,7 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
             )
         return new_quiz_text(user["id"], "toets")
 
-    if cleaned in {"uitleg", "oefen", "oefenen"}:
+    if cleaned in {"leer", "uitleg", "oefen", "oefenen"}:
         if (
             prompt
             and row_value(prompt, "mode", "toets") == "uitleg"
@@ -1393,14 +1509,14 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
             mode = row_value(user, "last_mode", "toets") or "toets"
             return new_quiz_text(user["id"], mode)
         if is_no(text):
-            return "Prima, later weer verder. Stuur '/toets' voor score of '/uitleg' om te oefenen."
+            return "Prima, later weer verder. Stuur '/toets' voor score of '/leer' om te oefenen."
         if cleaned in {"status", "score", "beloning"}:
             return weekly_progress_text(user["id"])
         if cleaned in {"naam", "name"}:
             with db() as con:
                 con.execute("UPDATE users SET awaiting_name = 1 WHERE id = ?", (user["id"],))
             return "Hoe heet je?"
-        return "Er staat nu geen quizvraag open. Stuur '/toets' voor score, '/uitleg' om te oefenen, of 'status' voor je weekscore."
+        return "Er staat nu geen quizvraag open. Stuur '/toets' voor score, '/leer' om te oefenen, of 'status' voor je weekscore."
 
     if is_yes(text):
         return quiz_text(prompt)
@@ -1411,7 +1527,9 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
     if cleaned in {"hint", "tip", "help", "hulp"}:
         already_used = bool(prompt["hint_used"]) if "hint_used" in prompt.keys() else False
         mark_hint_used(prompt["id"])
-        penalty = "" if already_used else f"\nHint gebruikt: als je dit woord nu goed hebt, telt het voor {hint_score():g} punt."
+        penalty = ""
+        if row_value(prompt, "mode", "toets") == "toets" and not already_used:
+            penalty = f"\nHint gebruikt: als je dit woord nu goed hebt, telt het voor {hint_score():g} punt."
         return f"{ai_hint(prompt)}{penalty}\n{quiz_text(prompt)}"
 
     if parse_dt(prompt["expires_at"]) and parse_dt(prompt["expires_at"]) < now():
@@ -1433,10 +1551,15 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
             (prompt["id"],),
         ).fetchone()
     mode = row_value(prompt, "mode", "toets")
-    choice = selected_choice(prompt, text) if mode == "uitleg" else None
-    correct = bool(choice and choice.get("correct")) if choice else is_correct(text, prompt["meaning"])
+    learning_note = ""
+    if mode == "uitleg":
+        correct, learning_note = evaluate_learning_answer(prompt, text)
+        choice = selected_choice(prompt, text)
+    else:
+        choice = None
+        correct = is_correct(text, prompt["meaning"])
     ai_result = None
-    if not correct and not choice:
+    if not correct and not choice and mode != "uitleg":
         ai_result = ai_grade_answer(prompt, text)
         if (
             ai_result
@@ -1447,14 +1570,14 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
     set_user_mode(user["id"], mode)
     if mode == "uitleg":
         record_unscored_answer(prompt, text, correct)
-        ai_note = ""
-        if ai_result and ai_result.get("reason_dutch"):
-            ai_note = f"\nIk snap je gedachte: {ai_result['reason_dutch']}"
-        if choice:
-            selected = f"\nJouw keuze: {choice['label']}. {choice['meaning']}"
-            ai_note = selected + ai_note
         verdict = "Mooi, dat klopt." if correct else f"Nog niet helemaal. {miss_micro_text()}"
-        return f"{verdict}{ai_note}\nDit telt niet mee voor je score.\n{prompt['greek']} = {prompt['meaning']}.\n{explanation(prompt)}\n{ai_hint(prompt)}\n{ask_more_text_for_mode(mode)}"
+        return (
+            f"{verdict}\n{learning_note}\n"
+            "Dit telt niet mee voor je score.\n\n"
+            f"UITLEG\n{explanation(prompt, include_tip=False)}\n"
+            f"{ai_hint(prompt)}\n"
+            f"{ask_more_text_for_mode(mode)}"
+        )
 
     update_word_after_answer(prompt, text, correct)
     session_id = row_value(prompt, "session_id")
@@ -1467,14 +1590,15 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
                 f"{result_line}\n{prompt['greek']} = {prompt['meaning']}.\n"
                 f"{format_session_finished(progress)}\n"
                 f"{weekly_progress_text(user['id'])}\n"
-                "Stuur '/uitleg' om de fouten na te bespreken, of '/toets 10' voor een nieuwe ronde."
+                "Stuur '/leer' om de fouten na te bespreken, of '/toets 10' voor een nieuwe ronde."
             )
         next_text = new_quiz_text(user["id"], "toets", session_id=int(session_id), source=progress["source"])
         result_line = f"Goed, {user['name']}! ✅" if correct else f"Bijna, maar niet goed. {miss_micro_text()}"
-        return (
+        result = (
             f"{result_line}\n{prompt['greek']} = {prompt['meaning']}.\n"
-            f"{format_session_progress(progress)}\n\n{next_text}"
+            f"{format_session_progress(progress)}"
         )
+        return separated_result(result, next_text)
     if correct:
         ai_note = ""
         if ai_result and ai_result.get("reason_dutch"):

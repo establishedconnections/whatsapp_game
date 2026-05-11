@@ -44,7 +44,7 @@ Hoi! Ik ben je Griekse woordjesbot.
 Zo werkt het:
 /toets 10 - start een toetsronde van 10 woorden
 /toets struikel - toets woorden die eerder fout gingen
-/uitleg - oefen foute woorden met meerkeuze en uitleg
+/leer - oefen foute woorden met meerkeuze en uitleg
 /hint - krijg hulp bij een open vraag
 status - bekijk je weekscore en beloning
 
@@ -215,7 +215,7 @@ Wil je er nog een? Antwoord met ja of nee.
 Er zijn twee modi:
 
 - `/toets`: echte toetsmodus. Antwoorden tellen mee voor score, beloningen en herhalingsschema.
-- `/uitleg`: oefenmodus op recente fouten uit de toets. Antwoorden tellen niet mee; de bot begint speels met multiple choice en legt daarna het woord extra uit met hint en vormen.
+- `/leer`: oefenmodus op recente fouten uit de toets. Antwoorden tellen niet mee; de bot begint speels met multiple choice, vormvragen of betekenisvragen en legt daarna het woord extra uit.
 
 Je kunt een toetsronde starten met een vast aantal woorden:
 
@@ -240,6 +240,8 @@ HINT_SCORE=0.5
 ```
 
 Hints worden per Grieks woord opgeslagen in de database. De eerste hint kan dus via OpenAI gemaakt worden; daarna wordt dezelfde hint goedkoop hergebruikt voor dat woord.
+
+Met `/reset` krijgt de gebruiker een bevestigingsvraag. Met `/reset bevestig` worden naam, open vragen, toetsrondes en statistiek voor die Telegram-gebruiker gewist.
 
 Bij een fout antwoord krijgt hij nu een korte uitleg:
 
