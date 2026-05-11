@@ -237,6 +237,16 @@ De eerste avatar is gratis. Standaard start een nieuwe leerling als Dionysos. Da
 
 Items horen bij de actieve avatar. Zo kan Dionysos een zonnebril hebben, en later kan Hermes of Zeus weer eigen versiering krijgen.
 
+Telegram kan bij `/mijnavatar` en na een succesvolle `/upgrade` ook een character-PNG meesturen. Zet daarvoor losse PNG-bestanden in:
+
+```text
+assets/greek_gods/dionysos.png
+assets/greek_gods/hermes.png
+assets/greek_gods/hephaestus.png
+```
+
+Gebruik lowercase slugs uit de godentrap. De oude map `assets/goden` wordt niet gebruikt.
+
 Met `/beloning` kun je een thuis afgesproken weekdoel vastleggen:
 
 ```text

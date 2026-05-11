@@ -28,6 +28,7 @@ except ModuleNotFoundError:
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "quiz.sqlite3"
+AVATAR_ASSET_DIR = APP_DIR / "assets" / "greek_gods"
 
 AVATAR_CATALOG = [
     ("dionysos", "Dionysos", "🍇", "feest, theater en druivenkracht", 0),
@@ -1043,6 +1044,20 @@ def active_avatar(con: sqlite3.Connection, user_id: int) -> sqlite3.Row:
     return ensure_avatar_profile(con, user_id)
 
 
+def avatar_asset_path(slug: str) -> Path | None:
+    for name in {slug, slug.lower(), slug.capitalize()}:
+        path = AVATAR_ASSET_DIR / f"{name}.png"
+        if path.exists():
+            return path
+    return None
+
+
+def active_avatar_asset_path(user_id: int) -> Path | None:
+    with db() as con:
+        avatar = active_avatar(con, user_id)
+    return avatar_asset_path(avatar["slug"])
+
+
 def starter_avatar_text(con: sqlite3.Connection) -> str:
     slug = ENV.get("STARTER_AVATAR", "dionysos")
     row = con.execute("SELECT symbol, name FROM avatar_catalog WHERE slug = ?", (slug,)).fetchone()
@@ -2021,6 +2036,55 @@ def telegram_send(body: str, to: str | None = None) -> dict[str, Any]:
     return response
 
 
+def telegram_send_photo(photo_path: Path, caption: str, to: str | None = None) -> dict[str, Any]:
+    token = ENV.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = to or ENV.get("TELEGRAM_CHAT_ID", "") or ENV.get("STUDENT_TO", "")
+    if not all([token, chat_id]) or not photo_path.exists():
+        log_event("dry_run_telegram_photo", {"caption": caption, "chat_id": chat_id, "photo": str(photo_path)})
+        return {"dry_run": True, "caption": caption, "photo": str(photo_path)}
+
+    boundary = f"----greek-gods-{int(time.time() * 1000)}"
+    photo_bytes = photo_path.read_bytes()
+    parts = [
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+            f"{chat_id}\r\n"
+        ).encode("utf-8"),
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="caption"\r\n\r\n'
+            f"{caption}\r\n"
+        ).encode("utf-8"),
+        (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="photo"; filename="{photo_path.name}"\r\n'
+            "Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8"),
+        photo_bytes,
+        f"\r\n--{boundary}--\r\n".encode("utf-8"),
+    ]
+    req = Request(f"https://api.telegram.org/bot{token}/sendPhoto", data=b"".join(parts), method="POST")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    try:
+        with urlopen(req, timeout=30) as res:
+            response = json.loads(res.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        log_event("telegram_photo_error", {"status": exc.code, "body": error_body, "caption": caption, "photo": str(photo_path)})
+        raise
+    log_event("telegram_photo", {"response": response, "caption": caption, "chat_id": chat_id, "photo": str(photo_path)})
+    return response
+
+
+def avatar_photo_for_reply(command_text: str, reply: str, user_id: int) -> Path | None:
+    cleaned = normalize(command_text)
+    wants_avatar = cleaned in {"mijnavatar", "mijn avatar", "mijnplaat", "mijn plaat"} or reply.startswith("Upgrade!")
+    if not wants_avatar:
+        return None
+    return active_avatar_asset_path(user_id)
+
+
 def send_quiz_now(user_id: int, to: str | None = None, mode: str = "toets") -> sqlite3.Row:
     current = active_prompt(user_id)
     if current and parse_dt(current["expires_at"]) and parse_dt(current["expires_at"]) > now():
@@ -2760,7 +2824,11 @@ class Handler(BaseHTTPRequestHandler):
             if message:
                 user = get_or_create_user("telegram", message["chat_id"])
                 reply = handle_answer(message["body"], user)
-                send_message(reply, to=message["chat_id"])
+                photo_path = avatar_photo_for_reply(message["body"], reply, user["id"])
+                if photo_path:
+                    telegram_send_photo(photo_path, reply, to=message["chat_id"])
+                else:
+                    send_message(reply, to=message["chat_id"])
                 log_event("telegram_reply", {"chat_id": message["chat_id"], "reply": reply, "message_id": message["message_id"]})
             self.send(200, b"OK", "text/plain")
             return
