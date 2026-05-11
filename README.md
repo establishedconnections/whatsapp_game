@@ -45,7 +45,8 @@ Zo werkt het:
 /toets 10 - start een toetsronde van 10 woorden
 /toets struikel - toets eerdere fouten voor extra score
 /leer - oefen met meerkeuze en uitleg; verdien oefenmunten
-/avatars - bekijk en koop Griekse goden
+/avatars - bekijk je godentrap richting Zeus
+/upgrade - stijg naar de volgende god met munten
 /winkel - koop versiering voor je actieve avatar
 /mijnavatar - bekijk je actieve verzamelplaat
 /hint - krijg hulp bij een open vraag
@@ -224,18 +225,17 @@ Er zijn twee modi:
 
 Oefenmunten zijn een aparte bucket naast de toets-score. Ze zijn bedoeld om inzet te belonen en kunnen worden ingewisseld voor verzamelplaten.
 
-De eerste avatar is gratis. Standaard krijgt een nieuwe leerling Athena. Daarna kan hij met munten andere Griekse goden kopen, of de actieve avatar versieren met items.
+De eerste avatar is gratis. Standaard start een nieuwe leerling als Dionysos. Daarna loopt hij met munten een godentrap omhoog tot Zeus. Avatars koop je dus niet los; je koopt steeds de volgende upgrade.
 
 ```text
 /avatars
-/kiesavatar athena
-/koop avatar zeus
+/upgrade
 /winkel
 /koop zonnebril
 /mijnavatar
 ```
 
-Items horen bij de actieve avatar. Zo kan Zeus een zonnebril hebben, terwijl Athena later haar eigen lauwerkrans of achtergrond krijgt.
+Items horen bij de actieve avatar. Zo kan Dionysos een zonnebril hebben, en later kan Hermes of Zeus weer eigen versiering krijgen.
 
 Met `/beloning` kun je een thuis afgesproken weekdoel vastleggen:
 

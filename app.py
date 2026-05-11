@@ -30,16 +30,17 @@ APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "quiz.sqlite3"
 
 AVATAR_CATALOG = [
-    ("athena", "Athena", "🦉", "wijsheid, helm en slimme plannen", 0),
-    ("zeus", "Zeus", "⚡", "bliksem, koning van de Olympus", 30),
-    ("poseidon", "Poseidon", "🔱", "zee, storm en drietand", 30),
-    ("hermes", "Hermes", "🪽", "snelheid, reizen en slimme streken", 25),
-    ("artemis", "Artemis", "🏹", "jacht, maan en scherpe focus", 25),
+    ("dionysos", "Dionysos", "🍇", "feest, theater en druivenkracht", 0),
+    ("hermes", "Hermes", "🪽", "snelheid, reizen en slimme streken", 10),
+    ("hephaestus", "Hephaestus", "🔨", "vuur, smeden en slimme techniek", 15),
+    ("artemis", "Artemis", "🏹", "jacht, maan en scherpe focus", 20),
     ("apollo", "Apollo", "☀️", "zon, muziek en helderheid", 25),
-    ("ares", "Ares", "🛡️", "strijd, lef en lawaai", 25),
-    ("hades", "Hades", "💀", "onderwereld en mysterieuze rijkdom", 35),
-    ("aphrodite", "Aphrodite", "🌹", "schoonheid en charme", 25),
-    ("dionysos", "Dionysos", "🍇", "feest, theater en druivenkracht", 25),
+    ("aphrodite", "Aphrodite", "🌹", "schoonheid en charme", 30),
+    ("ares", "Ares", "🛡️", "strijd, lef en lawaai", 35),
+    ("athena", "Athena", "🦉", "wijsheid, helm en slimme plannen", 40),
+    ("poseidon", "Poseidon", "🔱", "zee, storm en drietand", 45),
+    ("hades", "Hades", "💀", "onderwereld en mysterieuze rijkdom", 50),
+    ("zeus", "Zeus", "⚡", "bliksem, koning van de Olympus", 60),
 ]
 
 AVATAR_ITEMS = [
@@ -994,8 +995,9 @@ def ensure_avatar_profile(con: sqlite3.Connection, user_id: int) -> sqlite3.Row:
         (user_id,),
     ).fetchone()
     if active:
+        unlock_ladder_through(con, user_id, active["id"])
         return active
-    starter_slug = ENV.get("STARTER_AVATAR", "athena")
+    starter_slug = ENV.get("STARTER_AVATAR", "dionysos")
     starter = con.execute("SELECT * FROM avatar_catalog WHERE slug = ?", (starter_slug,)).fetchone()
     if not starter:
         starter = con.execute("SELECT * FROM avatar_catalog ORDER BY price ASC, id ASC LIMIT 1").fetchone()
@@ -1012,6 +1014,50 @@ def ensure_avatar_profile(con: sqlite3.Connection, user_id: int) -> sqlite3.Row:
 
 def active_avatar(con: sqlite3.Connection, user_id: int) -> sqlite3.Row:
     return ensure_avatar_profile(con, user_id)
+
+
+def starter_avatar_text(con: sqlite3.Connection) -> str:
+    slug = ENV.get("STARTER_AVATAR", "dionysos")
+    row = con.execute("SELECT symbol, name FROM avatar_catalog WHERE slug = ?", (slug,)).fetchone()
+    if not row:
+        row = con.execute("SELECT symbol, name FROM avatar_catalog ORDER BY price ASC, id ASC LIMIT 1").fetchone()
+    return f"{row['symbol']} {row['name']}" if row else "je eerste god"
+
+
+def ladder_avatars(con: sqlite3.Connection) -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM avatar_catalog ORDER BY price ASC, id ASC").fetchall()
+
+
+def unlock_ladder_through(con: sqlite3.Connection, user_id: int, avatar_id: int) -> None:
+    ladder = ladder_avatars(con)
+    target_index = next((index for index, avatar in enumerate(ladder) if avatar["id"] == avatar_id), None)
+    if target_index is None:
+        return
+    for avatar in ladder[: target_index + 1]:
+        con.execute(
+            "INSERT OR IGNORE INTO user_avatars(user_id, avatar_id, unlocked_at, is_active) VALUES (?, ?, ?, 0)",
+            (user_id, avatar["id"], dt(now())),
+        )
+
+
+def current_ladder_index(con: sqlite3.Connection, user_id: int) -> tuple[list[sqlite3.Row], int]:
+    active = active_avatar(con, user_id)
+    ladder = ladder_avatars(con)
+    for index, avatar in enumerate(ladder):
+        if avatar["id"] == active["id"]:
+            return ladder, index
+    return ladder, 0
+
+
+def highest_unlocked_ladder_index(con: sqlite3.Connection, user_id: int) -> tuple[list[sqlite3.Row], int]:
+    ladder = ladder_avatars(con)
+    owned_rows = con.execute("SELECT avatar_id FROM user_avatars WHERE user_id = ?", (user_id,)).fetchall()
+    owned_ids = {row["avatar_id"] for row in owned_rows}
+    highest = 0
+    for index, avatar in enumerate(ladder):
+        if avatar["id"] in owned_ids:
+            highest = max(highest, index)
+    return ladder, highest
 
 
 def avatar_item_names(con: sqlite3.Connection, user_id: int, avatar_id: int) -> list[str]:
@@ -1033,11 +1079,14 @@ def avatar_status_text(user_id: int) -> str:
         avatar = active_avatar(con, user_id)
         coins = user_coin_balance(con, user_id)
         items = avatar_item_names(con, user_id, avatar["id"])
+        ladder, index = highest_unlocked_ladder_index(con, user_id)
     item_text = ", ".join(items) if items else "nog geen versiering"
+    next_text = "Je staat bovenaan de godentrap." if index >= len(ladder) - 1 else f"Volgende upgrade: {ladder[index + 1]['symbol']} {ladder[index + 1]['name']} voor {ladder[index + 1]['price']} 🪙."
     return (
         f"Mijn avatar: {avatar['symbol']} {avatar['name']}\n"
         f"Stijl: {item_text}.\n"
-        f"Munten: {coin_count(coins)} 🪙."
+        f"Munten: {coin_count(coins)} 🪙.\n"
+        f"{next_text}"
     )
 
 
@@ -1045,6 +1094,8 @@ def avatar_collection_text(user_id: int) -> str:
     with db() as con:
         ensure_avatar_profile(con, user_id)
         coins = user_coin_balance(con, user_id)
+        active = active_avatar(con, user_id)
+        ladder = ladder_avatars(con)
         rows = con.execute(
             """
             SELECT avatar_catalog.*,
@@ -1058,12 +1109,27 @@ def avatar_collection_text(user_id: int) -> str:
             """,
             (user_id,),
         ).fetchall()
-    lines = [f"Avatarcollectie - {coin_count(coins)} 🪙", ""]
-    for row in rows:
-        marker = "actief" if row["is_active"] else "in bezit" if row["owned"] else f"{row['price']} 🪙"
-        lines.append(f"{row['symbol']} {row['name']} ({marker}) - {row['description']}")
-    lines.append("")
-    lines.append("Gebruik '/kiesavatar athena' of '/koop avatar zeus'.")
+    owned_by_id = {row["id"]: row for row in rows if row["owned"]}
+    lines = [f"Godentrap - {coin_count(coins)} 🪙", ""]
+    next_avatar = None
+    for avatar in ladder:
+        row = owned_by_id.get(avatar["id"])
+        if avatar["id"] == active["id"]:
+            marker = "jij bent hier"
+        elif row:
+            marker = "gehaald"
+        elif next_avatar is None:
+            marker = f"volgende: {avatar['price']} 🪙"
+            next_avatar = avatar
+        else:
+            marker = f"later: {avatar['price']} 🪙"
+        lines.append(f"{avatar['symbol']} {avatar['name']} ({marker}) - {avatar['description']}")
+    if next_avatar:
+        lines.append("")
+        lines.append(f"Gebruik '/upgrade' om naar {next_avatar['symbol']} {next_avatar['name']} te gaan.")
+    else:
+        lines.append("")
+        lines.append("Je hebt Zeus bereikt. De top van de Olympus.")
     return "\n".join(lines)
 
 
@@ -1089,7 +1155,7 @@ def avatar_shop_text(user_id: int) -> str:
         marker = "gekocht" if row["owned"] else f"{row['price']} 🪙"
         lines.append(f"{row['symbol']} {row['name']} ({marker}) - {row['description']}")
     lines.append("")
-    lines.append("Gebruik '/koop zonnebril'. Nieuwe god? Gebruik '/koop avatar hermes'.")
+    lines.append("Gebruik '/koop zonnebril'. Volgende god? Gebruik '/upgrade'.")
     return "\n".join(lines)
 
 
@@ -1126,36 +1192,48 @@ def set_active_avatar(user_id: int, query: str) -> str:
             (user_id, avatar["id"]),
         ).fetchone()
         if not owned:
-            return f"{avatar['symbol']} {avatar['name']} is nog vergrendeld. Koop deze avatar met '/koop avatar {avatar['slug']}' voor {avatar['price']} 🪙."
+            return f"{avatar['symbol']} {avatar['name']} is nog niet bereikt op de godentrap. Gebruik '/upgrade' om stap voor stap omhoog te gaan."
         con.execute("UPDATE user_avatars SET is_active = 0 WHERE user_id = ?", (user_id,))
         con.execute("UPDATE user_avatars SET is_active = 1 WHERE user_id = ? AND avatar_id = ?", (user_id, avatar["id"]))
     return f"Actieve avatar: {avatar['symbol']} {avatar['name']}."
 
 
-def buy_avatar(user_id: int, query: str) -> str:
+def next_ladder_avatar(con: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
+    ladder, index = highest_unlocked_ladder_index(con, user_id)
+    if index >= len(ladder) - 1:
+        return None
+    return ladder[index + 1]
+
+
+def upgrade_avatar(user_id: int) -> str:
     with db() as con:
         ensure_avatar_profile(con, user_id)
-        avatar = find_avatar(con, query)
+        avatar = next_ladder_avatar(con, user_id)
         if not avatar:
-            return "Die god ken ik nog niet. Kijk met '/avatars' welke avatars er zijn."
-        owned = con.execute(
-            "SELECT 1 FROM user_avatars WHERE user_id = ? AND avatar_id = ?",
-            (user_id, avatar["id"]),
-        ).fetchone()
-        if owned:
-            return f"{avatar['symbol']} {avatar['name']} heb je al. Kies hem met '/kiesavatar {avatar['slug']}'."
+            return "Je staat al bij ⚡ Zeus. Hoger kan de godentrap niet."
         coins = user_coin_balance(con, user_id)
         price = int(avatar["price"] or 0)
         if coins < price:
-            return f"Nog niet genoeg munten voor {avatar['symbol']} {avatar['name']}. Nodig: {price} 🪙, jij hebt {coin_count(coins)} 🪙."
+            needed = price - coins
+            return f"Nog {coin_count(needed)} 🪙 nodig voor de volgende stap: {avatar['symbol']} {avatar['name']} kost {price} 🪙. Jij hebt {coin_count(coins)} 🪙."
         con.execute("UPDATE users SET learn_coins = learn_coins - ?, last_seen_at = ? WHERE id = ?", (price, dt(now()), user_id))
         con.execute("UPDATE user_avatars SET is_active = 0 WHERE user_id = ?", (user_id,))
         con.execute(
-            "INSERT INTO user_avatars(user_id, avatar_id, unlocked_at, is_active) VALUES (?, ?, ?, 1)",
+            """
+            INSERT INTO user_avatars(user_id, avatar_id, unlocked_at, is_active)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(user_id, avatar_id) DO UPDATE SET is_active = 1
+            """,
             (user_id, avatar["id"], dt(now())),
         )
         remaining = coins - price
-    return f"Vrijgespeeld: {avatar['symbol']} {avatar['name']}! Deze avatar is nu actief. Over: {coin_count(remaining)} 🪙."
+        next_avatar = next_ladder_avatar(con, user_id)
+    next_text = "" if not next_avatar else f"\nDaarna: {next_avatar['symbol']} {next_avatar['name']} voor {next_avatar['price']} 🪙."
+    return f"Upgrade! Je bent nu {avatar['symbol']} {avatar['name']}. Over: {coin_count(remaining)} 🪙.{next_text}"
+
+
+def buy_avatar(user_id: int, query: str) -> str:
+    return "Avatars koop je niet los meer. Je loopt de godentrap omhoog met '/upgrade'. Kijk met '/avatars' wat de volgende stap is."
 
 
 def buy_avatar_item(user_id: int, query: str) -> str:
@@ -1194,6 +1272,8 @@ def handle_avatar_command(user_id: int, text: str) -> str | None:
         return avatar_status_text(user_id)
     if cleaned in {"winkel", "shop"}:
         return avatar_shop_text(user_id)
+    if cleaned in {"upgrade", "levelup", "level up", "trap", "godentrap"}:
+        return upgrade_avatar(user_id)
     for prefix in ("kiesavatar ", "kies avatar ", "kiesplaat ", "kies plaat "):
         if cleaned.startswith(prefix):
             return set_active_avatar(user_id, cleaned[len(prefix):].strip())
@@ -1219,6 +1299,7 @@ def is_avatar_command(text: str) -> bool:
         or cleaned.startswith("kiesplaat ")
         or cleaned.startswith("kies plaat ")
         or cleaned.startswith("koop ")
+        or cleaned in {"upgrade", "levelup", "level up", "trap", "godentrap"}
     )
 
 
@@ -2222,7 +2303,8 @@ def help_text(registered: bool = True, name: str | None = None) -> str:
         "/toets 10 - start een toetsronde van 10 woorden",
         "/toets struikel - toets eerdere fouten voor extra score",
         "/leer - oefen met meerkeuze en uitleg; verdien oefenmunten",
-        "/avatars - bekijk en koop Griekse goden",
+        "/avatars - bekijk je godentrap richting Zeus",
+        "/upgrade - stijg naar de volgende god met munten",
         "/winkel - koop versiering voor je actieve avatar",
         "/mijnavatar - bekijk je actieve verzamelplaat",
         "/hint - krijg hulp bij een open vraag",
@@ -2302,9 +2384,11 @@ def handle_answer(text: str, user: sqlite3.Row) -> str:
         if cleaned in {"quiz", "vraag", "toets", "uitleg", "leer", "ja"} or text.strip().startswith("/"):
             return help_text(registered=False)
         user = set_user_name(user["id"], text)
+        with db() as con:
+            starter = starter_avatar_text(con)
         return (
             f"Leuk je te leren kennen, {user['name']}!\n"
-            "Je eerste avatar is gratis vrijgespeeld: 🦉 Athena.\n\n"
+            f"Je eerste avatar is gratis vrijgespeeld: {starter}.\n\n"
             f"{help_text(name=user['name'])}"
         )
 
